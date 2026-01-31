@@ -10,19 +10,14 @@ import { go } from '@codemirror/lang-go';
 import { oneDark } from '@codemirror/theme-one-dark';
 import { EditorView } from '@codemirror/view';
 
-// Расширение для включения выделения текста
-const enableTextSelection = EditorView.contentAttributes.of({
-  'data-enable-text-selection': 'true'
-});
 import { syntaxHighlighting, HighlightStyle } from '@codemirror/language';
 import { tags } from '@lezer/highlight';
 import { autocompletion, CompletionContext } from '@codemirror/autocomplete';
 import { keymap } from '@codemirror/view';
 import { Decoration, ViewPlugin, WidgetType } from '@codemirror/view';
-import { StateField, EditorState } from '@codemirror/state';
+import { StateField, EditorState, EditorSelection } from '@codemirror/state';
 import { selectAll, toggleComment } from '@codemirror/commands';
 import { bracketMatching, foldGutter, foldKeymap } from '@codemirror/language';
-import { drawSelection } from '@codemirror/view';
 import './App.css';
 
 const { ipcRenderer } = window.require ? window.require('electron') : { ipcRenderer: null };
@@ -40,15 +35,15 @@ function App() {
   const [isResizingVertical, setIsResizingVertical] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [splitView, setSplitView] = useState(false);
-  const [errorLines, setErrorLines] = useState([]);
   const [showWindowChoiceModal, setShowWindowChoiceModal] = useState(false);
   const [showTabSplitModal, setShowTabSplitModal] = useState(false);
-  const [showColorSettings, setShowColorSettings] = useState(true);
-  const [showFontColor, setShowFontColor] = useState(true);
-  const [showKeywordColor, setShowKeywordColor] = useState(true);
-  const [showClassNameColor, setShowClassNameColor] = useState(true);
-  const [showVariableColor, setShowVariableColor] = useState(true);
-  const [showBackgroundColor, setShowBackgroundColor] = useState(true);
+  const [errorLines, setErrorLines] = useState([]);
+  const [showColorSettings, setShowColorSettings] = useState(false);
+  const [showFontColor, setShowFontColor] = useState(false);
+  const [showKeywordColor, setShowKeywordColor] = useState(false);
+  const [showClassNameColor, setShowClassNameColor] = useState(false);
+  const [showVariableColor, setShowVariableColor] = useState(false);
+  const [showBackgroundColor, setShowBackgroundColor] = useState(false);
   const [showHotkeys, setShowHotkeys] = useState(true);
   const [tabs, setTabs] = useState([{ id: 'tab-1', name: 'Вкладка 1', code: '', output: '', language: 'javascript' }]); // Вкладки для single view: [{id, name, code, output, language}]
   const [activeTab, setActiveTab] = useState('tab-1');
@@ -71,8 +66,11 @@ function App() {
   const [lastSqlCode, setLastSqlCode] = useState('');
   const [lastNonSqlCode, setLastNonSqlCode] = useState('');
   const lastSqlTabsRef = useRef({ tabs1: null, tabs2: null, activeTab1: null, activeTab2: null });
+  const lastSqlSchemaRef = useRef({ tables: [], tableDataView: null, erdPositions: {} });
   // Хранилище вкладок для каждого языка (включая SQL)
   const tabsByLanguageRef = useRef({});
+  // Язык, с которого вошли в SQL (чтобы при выходе восстанавливать вкладки по нему)
+  const langBeforeSqlRef = useRef(null);
 
   // Состояния для split view - независимые окна
   const [code1, setCode1] = useState('');
@@ -226,10 +224,37 @@ function App() {
     return sqlJsInitPromiseRef.current;
   }, []);
 
+  const saveSqlDbToStorage = useCallback(() => {
+    try {
+      const db = sqlJsDbRef.current;
+      if (!db) return;
+      const data = db.export();
+      if (!data || data.length === 0) return;
+      let binary = '';
+      for (let i = 0; i < data.length; i++) binary += String.fromCharCode(data[i]);
+      localStorage.setItem('codeforge_sqlite_db', btoa(binary));
+    } catch (e) {
+      console.warn('Не удалось сохранить SQLite БД:', e);
+    }
+  }, []);
+
   const getOrCreateSqlDb = useCallback(async () => {
     const SQL = await getSqlJs();
     if (!sqlJsDbRef.current) {
-      sqlJsDbRef.current = new SQL.Database();
+      try {
+        const saved = localStorage.getItem('codeforge_sqlite_db');
+        if (saved) {
+          const binary = atob(saved);
+          const bytes = new Uint8Array(binary.length);
+          for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+          sqlJsDbRef.current = new SQL.Database(bytes);
+        } else {
+          sqlJsDbRef.current = new SQL.Database();
+        }
+      } catch (_) {
+        sqlJsDbRef.current = new SQL.Database();
+      }
+      sqlJsDbRef.current.run('PRAGMA foreign_keys = ON');
     }
     return sqlJsDbRef.current;
   }, [getSqlJs]);
@@ -250,16 +275,21 @@ function App() {
     return lines.join('\n');
   }, []);
 
-  // Препроцессинг одного оператора для SQLite (ENUM, BOOLEAN, INDEX, UNIQUE KEY и т.д.)
+  // Препроцессинг одного оператора для SQLite (ENUM, BOOLEAN, CREATE TYPE и т.д.)
   const preprocessSqlStatement = useCallback((stmt) => {
     let s = stmt
       .replace(/\bCREATE\s+TABLE\s+(?!IF\s+NOT\s+EXISTS)/gi, 'CREATE TABLE IF NOT EXISTS ')
       .replace(/\bINT\s+PRIMARY\s+KEY\s+AUTO_INCREMENT\b/gi, 'INTEGER PRIMARY KEY AUTOINCREMENT')
       .replace(/\bAUTO_INCREMENT\b/gi, 'AUTOINCREMENT')
+      .replace(/\bSERIAL\b/gi, 'INTEGER')
       .replace(/\bBOOLEAN\b/gi, 'INTEGER')
       .replace(/\bDEFAULT\s+TRUE\b/gi, 'DEFAULT 1')
       .replace(/\bDEFAULT\s+FALSE\b/gi, 'DEFAULT 0')
       .replace(/\bENUM\s*\([^)]+\)/gi, 'TEXT')
+      .replace(/\bNUMERIC\s*\(\d+\s*,\s*\d+\)/gi, 'REAL')
+      .replace(/\bTIMESTAMP\b/gi, 'TEXT')
+      .replace(/\bVARCHAR\s*\(\d+\)/gi, 'TEXT')
+      .replace(/\border_status\b/gi, 'TEXT')
       .replace(/\bUNIQUE\s+KEY\s+\w+\s*\(/gi, 'UNIQUE (');
     // SQLite не поддерживает INDEX/KEY внутри CREATE TABLE — удаляем
     s = s.replace(/,?\s*INDEX\s+\w+\s*\([^)]+\)\s*,/gi, ',');
@@ -290,6 +320,11 @@ function App() {
       stmt = preprocessSqlStatement(stmt);
       const upper = stmt.toUpperCase();
       try {
+        if (/^\s*CREATE\s+TYPE\b/i.test(stmt)) {
+          outputLines.push('CREATE TYPE пропущен (SQLite не поддерживает, тип заменён на TEXT).');
+          outputLines.push('');
+          continue;
+        }
         if (upper.includes('SELECT')) {
           hadSelect = true;
           const result = db.exec(stmt);
@@ -307,7 +342,10 @@ function App() {
               outputLines.push(row.map((v, j) => String(v ?? 'NULL').padEnd(colWidths[j])).join(' | '));
             });
             if (values.length > 500) outputLines.push(`... (показано 500 из ${values.length} строк)`);
-            if (values.length === 0) outputLines.push('(0 строк)');
+            if (values.length === 0) {
+              outputLines.push('(0 строк)');
+              outputLines.push('Если таблицы пусты — выполните CREATE TABLE и INSERT в том же блоке до SELECT.');
+            }
             outputLines.push('');
           } else {
             outputLines.push('(0 строк)');
@@ -315,6 +353,7 @@ function App() {
           }
         } else {
           db.run(stmt);
+          saveSqlDbToStorage();
           if (upper.includes('CREATE TABLE')) outputLines.push(upper.includes('IF NOT EXISTS') ? 'CREATE TABLE выполнено (или уже существовала).' : 'CREATE TABLE выполнено.');
           else if (upper.includes('INSERT')) outputLines.push('INSERT выполнено.');
           else if (upper.includes('UPDATE')) outputLines.push('UPDATE выполнено.');
@@ -364,7 +403,7 @@ function App() {
 
     const finalOutput = outputLines.join('\n').trim();
     return { output: finalOutput || (hadSelect ? '(0 строк)' : 'Выполнено.'), error: null, tables };
-  }, [getOrCreateSqlDb, preprocessSqlStatement]);
+  }, [getOrCreateSqlDb, preprocessSqlStatement, saveSqlDbToStorage]);
 
   // Находим связи между таблицами (по именам колонок: user_id -> users, order_id -> orders и т.д.)
   const findTableRelations = () => {
@@ -464,11 +503,9 @@ function App() {
   };
 
   const toggleSqlMode = () => {
-    // Переключение специального SQL-режима
     if (!sqlMode) {
-      // ВХОД в SQL-режим
-      // Сохраняем текущие вкладки для текущего языка
       const currentLang = splitView ? language1 : language;
+      langBeforeSqlRef.current = currentLang;
       if (splitView) {
         tabsByLanguageRef.current[currentLang] = {
           tabs1: [...tabs1],
@@ -490,24 +527,61 @@ function App() {
       setLastNonSqlCode(currentCode || '');
 
       const saved = lastSqlTabsRef.current;
-      const hasSavedTabs = saved.tabs1 && saved.tabs1.length > 0;
+      let hasSavedTabs = saved.tabs1 && saved.tabs1.length > 0;
+      let dataToUse = hasSavedTabs ? saved : null;
+      if (!hasSavedTabs) {
+        const fromStorage = loadSqlFromStorage();
+        if (fromStorage) {
+          dataToUse = fromStorage;
+          hasSavedTabs = true;
+          lastSqlTabsRef.current = fromStorage;
+        }
+      } else {
+        dataToUse = saved;
+      }
 
       setSqlMode(true);
       setSplitView(true);
+      setOutput1('');
+      setOutput2('');
 
-      if (hasSavedTabs) {
-        setTabs1(saved.tabs1);
-        setTabs2(saved.tabs2);
-        setActiveTab1(saved.activeTab1 || saved.tabs1[0]?.id || 'tab1-1');
-        setActiveTab2(saved.activeTab2 || saved.tabs2[0]?.id || 'tab2-1');
-        const activeId1 = saved.activeTab1 || saved.tabs1[0]?.id;
-        const activeId2 = saved.activeTab2 || saved.tabs2[0]?.id;
-        const activeTab1Obj = saved.tabs1.find(t => t.id === activeId1);
-        const activeTab2Obj = saved.tabs2.find(t => t.id === activeId2);
+      const schema = lastSqlSchemaRef.current;
+      let schemaTables = schema.tables;
+      let schemaErd = schema.erdPositions;
+      if (!schema.tables || schema.tables.length === 0) {
+        try {
+          const rawSchema = localStorage.getItem('codeforge_sql_schema');
+          if (rawSchema) {
+            const parsed = JSON.parse(rawSchema);
+            if (parsed.tables && parsed.tables.length > 0) {
+              schemaTables = parsed.tables;
+              schemaErd = parsed.erdPositions || {};
+              lastSqlSchemaRef.current = { ...lastSqlSchemaRef.current, tables: schemaTables, erdPositions: schemaErd };
+            }
+          }
+        } catch (_) {}
+      }
+      if (schemaTables && schemaTables.length > 0) {
+        setSqlTables(schemaTables);
+        setSqlTableDataView(schema.tableDataView);
+        setErdPositions(schemaErd || {});
+      } else {
+        setSqlTables([]);
+        setSqlTableDataView(null);
+      }
+
+      if (hasSavedTabs && dataToUse) {
+        setTabs1(dataToUse.tabs1);
+        setTabs2(dataToUse.tabs2);
+        setActiveTab1(dataToUse.activeTab1 || dataToUse.tabs1[0]?.id || 'tab1-1');
+        setActiveTab2(dataToUse.activeTab2 || dataToUse.tabs2[0]?.id || 'tab2-1');
+        const activeId1 = dataToUse.activeTab1 || dataToUse.tabs1[0]?.id;
+        const activeId2 = dataToUse.activeTab2 || dataToUse.tabs2[0]?.id;
+        const activeTab1Obj = dataToUse.tabs1.find(t => t.id === activeId1);
+        const activeTab2Obj = dataToUse.tabs2.find(t => t.id === activeId2);
         setCode1((activeTab1Obj?.code ?? lastSqlCode) || currentCode || '');
         setCode2(activeTab2Obj?.code ?? '');
         codeByDialectRef.current.sql = (activeTab1Obj?.code ?? lastSqlCode) || currentCode || '';
-        setSqlTables(parseSqlTablesFromCode((activeTab1Obj?.code ?? lastSqlCode) || currentCode || ''));
       } else {
         const baseCode = lastSqlCode || currentCode || '';
         setCode1(baseCode);
@@ -517,48 +591,62 @@ function App() {
         setActiveTab1('tab1-1');
         setActiveTab2('tab2-1');
         codeByDialectRef.current.sql = baseCode;
-        setSqlTables(parseSqlTablesFromCode(baseCode));
       }
       setLanguage1(language1 || 'javascript');
       setLanguage2(language2 || 'javascript');
     } else {
-      // ВЫХОД из SQL-режима — сохраняем вкладки SQL для следующего входа
-      lastSqlTabsRef.current = { tabs1: [...tabs1], tabs2: [...tabs2], activeTab1, activeTab2 };
+      // ВЫХОД из SQL-режима — сохраняем вкладки и схему (таблицы, диаграммы) для следующего входа
+      const t1 = tabs1.map(t => t.id === activeTab1 ? { ...t, code: code1 } : t);
+      const t2 = tabs2.map(t => t.id === activeTab2 ? { ...t, code: code2 } : t);
+      lastSqlTabsRef.current = { tabs1: t1, tabs2: t2, activeTab1, activeTab2 };
+      lastSqlSchemaRef.current = {
+        tables: [...sqlTables],
+        tableDataView: sqlTableDataView ? { ...sqlTableDataView } : null,
+        erdPositions: { ...erdPositions }
+      };
+      try {
+        localStorage.setItem('codeforge_sql_tabs1', JSON.stringify(t1));
+        localStorage.setItem('codeforge_sql_tabs2', JSON.stringify(t2));
+        localStorage.setItem('codeforge_sql_activeTab1', activeTab1);
+        localStorage.setItem('codeforge_sql_activeTab2', activeTab2);
+        localStorage.setItem('codeforge_sql_schema', JSON.stringify({ tables: sqlTables, erdPositions }));
+      } catch (_) {}
       const currentSqlCode = splitView ? code1 : code;
       setLastSqlCode(currentSqlCode || '');
 
       setSqlMode(false);
-      
-      // Восстанавливаем вкладки для текущего языка (если есть сохраненные)
-      const targetLang = splitView ? language1 : language;
+      setOutput1('');
+      setOutput2('');
+      setOutput('');
+
+      const targetLang = langBeforeSqlRef.current != null ? langBeforeSqlRef.current : (splitView ? language1 : language);
       const savedForLang = tabsByLanguageRef.current[targetLang];
-      
+
       if (savedForLang) {
-        if (splitView && savedForLang.tabs1) {
+        if (savedForLang.tabs1 && savedForLang.tabs1.length > 0) {
           setTabs1(savedForLang.tabs1);
-          setTabs2(savedForLang.tabs2);
-          setActiveTab1(savedForLang.activeTab1);
-          setActiveTab2(savedForLang.activeTab2);
+          setTabs2(savedForLang.tabs2 || [{ id: 'tab2-1', name: 'Вкладка 2', code: '', output: '', language: targetLang }]);
+          setActiveTab1(savedForLang.activeTab1 || savedForLang.tabs1[0]?.id);
+          setActiveTab2(savedForLang.activeTab2 || (savedForLang.tabs2?.[0]?.id) || 'tab2-1');
           setCode1(savedForLang.code1 || '');
           setCode2(savedForLang.code2 || '');
-        } else if (!splitView && savedForLang.tabs) {
+          setLanguage1(targetLang);
+          setLanguage2(targetLang);
+          setSplitView(true);
+        } else if (savedForLang.tabs) {
           setTabs(savedForLang.tabs);
           setActiveTab(savedForLang.activeTab);
           setCode(savedForLang.code || '');
+          setLanguage(targetLang);
+          setSplitView(false);
         }
       } else {
-        // Если нет сохраненных вкладок, создаем пустую
-        if (splitView) {
-          setCode1('');
-          setTabs1([{ id: 'tab1-1', name: 'Вкладка 1', code: '', output: '', language: language1 }]);
-          setActiveTab1('tab1-1');
-        } else {
-          setCode('');
-          setTabs([{ id: 'tab-1', name: 'Вкладка 1', code: '', output: '', language: language }]);
-          setActiveTab('tab-1');
-        }
+        setCode('');
+        setTabs([{ id: 'tab-1', name: 'Вкладка 1', code: '', output: '', language: language }]);
+        setActiveTab('tab-1');
+        setSplitView(false);
       }
-      
+
       setSqlTables([]);
     }
   };
@@ -596,7 +684,7 @@ function App() {
     // Белые тона
     '#FFFFFF', '#FFFAFA', '#F0FFF0', '#F5FFFA', '#F0FFFF', '#F0F8FF', '#F8F8FF', '#F5F5F5', '#FFF5EE', '#F5F5DC', '#FDF5E6', '#FFFAF0', '#FFFFF0', '#FAEBD7', '#FAF0E6', '#FFF0F5', '#FFE4E1',
     // Серые тона
-    '#DCDCDC', '#D3D3D3', '#C0C0C0', '#A9A9A9', '#808080', '#696969', '#778899', '#708090', '#2F4F4F', '#000000',
+    '#DCDCDC', '#D3D3D3', '#C0C0C0', '#A9A9A9', '#808080', '#696969', '#778899', '#708090', '#4C5866', '#000000',
     // Дополнительные цвета (из списка)
     '#c93f38', '#a59344', '#7b463b', '#dd3366', '#191971', '#e56e24', '#dfc685', '#225577', '#c0a98e', '#d2d2c0', '#9bafad', '#990066', '#3d1c02', '#f2850d', '#94568c', '#5ba8ff', '#88ddbb', '#ffccda', '#ffaabb', '#d1edee', '#d3dde4', '#456789', '#f6ecde', '#ffbcc5', '#bcddb3', '#bfaf92', '#f3e9d9', '#88ffcc', '#05a3ad', '#00b89f', '#1150af', '#231f20', '#f2f1e6', '#e1ded9', '#f8f3f6', '#94877e', '#746e6a', '#747a8a', '#cd716b', '#a79f92', '#aba798', '#ece6d0', '#4c4f56', '#4d3c2d', '#166461', '#eae3d2', '#c04641', '#f1cbcd', '#77aa77', '#966165', '#eec400', '#15151c', '#76b583', '#008a60', '#ff9944', '#0048ba', '#ede9dd', '#e4cb97', '#629763', '#a19361', '#8f9e9d', '#1b2632', '#00035b', '#10246a', '#005765', '#404c57', '#3d5758', '#000033', '#486241', '#969c92', '#dacd65', '#2c3e56', '#525367', '#e5b7be', '#35312c', '#42314b', '#942193', '#46295a', '#4c2f27', '#90977a', '#9899a7', '#7fa8a7', '#4e9aa8', '#65a7dd', '#eb8a44', '#75aa94', '#208468', '#e56d00', '#d2c7b7', '#7c94b2', '#727a5f', '#4e4f48', '#efedd7', '#a8c74d', '#11ff22', '#8ffe09', '#badf30', '#00ee22', '#33ee66', '#30ff21', '#4fc172', '#00ff22', '#9e9991', '#ffd8b1', '#7249d6', '#9c52f2', '#d48948', '#b87439', '#eda740', '#7e5e52', '#efece1', '#b3e1e8', '#ff44ee', '#00504b', '#00a67e', '#006f72', '#bb1133', '#a7a6a3', '#46adf9', '#3b845e', '#661111', '#867e70', '#585d58', '#ccb0b5', '#293947', '#50647f', '#404e61', '#f6f3d3', '#fb9587', '#dcbfa6', '#ba9f99', '#e8dec5', '#e5c1a7', '#c3a998', '#e6dbc4', '#bd6c48', '#a99681', '#efbf4d', '#64b5bf', '#8d8dc9', '#e3beb0', '#5c899b', '#96c6cd', '#d3ece4', '#016081', '#93b8e3', '#4b9099', '#20726a', '#f87858', '#6f9fb9', '#eda367', '#3063af', '#34788c', '#72664f', '#7cac88', '#d8cb4b', '#0081a8', '#53a079', '#e6d3b6', '#4e6e81', '#4c8c72', '#9cbbe2', '#508fa2', '#e48b59', '#9ba0a4', '#a0b2c8', '#c0e8d5', '#7cb9e8', '#a2c348', '#2b3448', '#ff4f00', '#355376', '#e3ddd3', '#745085', '#baffff', '#fed2a5', '#905e26', '#e2d7b5', '#d3a95c', '#78a3c2', '#c7927a', '#939899', '#cd4a4a', '#826c68', '#86714a', '#645e42', '#b16b40', '#ccaa88', '#b085b7', '#fd8b60', '#3c3535', '#e3f5e5', '#d6eae8', '#3d2e24', '#38393f', '#c1dbea', '#fec65f', '#24246d', '#8bc4d1', '#33616a', '#c95efb', '#85c0cd', '#f3e6c9', '#d91fff', '#d9c5a1', '#594e40', '#fbcb78', '#bbc5de', '#956a60', '#599f99', '#b1b09f', '#5a5b74', '#5a6e6a', '#6b7169', '#879c67', '#879d99', '#886b2e', '#846262', '#d7cfc0', '#87413f', '#5f4947', '#e0dcda', '#898253', '#dd9944', '#6c6956', '#73343a', '#7e7e7e', '#6e6e30', '#7e7666', '#ceb588', '#e9ddca', '#889999', '#c99f99', '#fffa86', '#a442a0', '#7a4134', '#9d7147', '#e8decd', '#895460', '#a58ea9', '#e7a995', '#ececdf', '#6fffff', '#ff7799', '#6a5b4e', '#393121', '#d1cbc1', '#a17c59', '#00fbff', '#f0e2d3', '#9fc5cc', '#00fa92', '#c22147', '#0082a1', '#2a3149', '#199ebd', '#274447', '#b4c8b6', '#ecf7f7', '#eee5e1', '#2e372e', '#77acc7', '#d7d1e9', '#5d8aa8', '#72a0c1', '#d8f2ee', '#f6dcd2', '#a2c2d0', '#aa6c51', '#354f58', '#939498', '#2a2c1f', '#edf2f8', '#d9e5e4', '#364d70', '#8c9632', '#aec1d4', '#88ccee', '#dbe0c4', '#dae6e9', '#faecd9', '#d3de7b', '#c3272b', '#bc012e', '#f07f5e', '#c90b42', '#beb29a', '#cf3a24', '#983fb2', '#fa7b62', '#b0e313', '#601ef9', '#e12120', '#871646', '#a32638', '#e9e3d2', '#f0debd', '#dfd4bf', '#f3e7db', '#5500ff', '#81585b', '#8e8c97', '#ffae52', '#ca9234', '#939b71', '#ec0003', '#2ce335', '#dadad1', '#6da9d2', '#bcbebc', '#7e9ec2', '#ecf0e5', '#05472a', '#cddced', '#bae3eb', '#cc0001', '#38546e', '#4f5845', '#e1dacb', '#fbeee5', '#cca47e', '#e7cf8c', '#aaa492', '#7a4b49', '#954e2c', '#f1ceb3', '#4d7eaa', '#9a9eb3', '#db9785', '#ff8f73', '#fcefc1', '#bcd9dc', '#767853', '#598c74', '#416082', '#a55232', '#78ad6d', '#546940', '#b7b59f', '#80365a', '#8da98d', '#93dfb8', '#983d53', '#54ac68', '#21c36f', '#479784', '#fc5a50', '#00859c', '#c1dbec', '#f7f2e1', '#00a465', '#008778', '#d4cbc4', '#c2ced2', '#886b2e', '#d7cfc0', '#87413f', '#5f4947', '#e0dcda', '#898253', '#dd9944', '#6c6956', '#73343a', '#7e7e7e', '#6e6e30', '#7e7666', '#ceb588', '#e9ddca', '#889999', '#c99f99', '#fffa86', '#a442a0', '#7a4134', '#9d7147', '#e8decd', '#895460', '#a58ea9', '#e7a995', '#ececdf', '#6fffff', '#ff7799', '#6a5b4e', '#393121', '#d1cbc1', '#a17c59', '#00fbff', '#f0e2d3', '#9fc5cc', '#00fa92', '#c22147', '#0082a1', '#2a3149', '#199ebd', '#274447', '#b4c8b6', '#ecf7f7', '#eee5e1', '#2e372e', '#77acc7', '#d7d1e9', '#5d8aa8', '#72a0c1', '#d8f2ee', '#f6dcd2', '#a2c2d0', '#aa6c51', '#354f58', '#939498', '#2a2c1f', '#edf2f8', '#d9e5e4', '#364d70', '#8c9632', '#aec1d4', '#88ccee', '#dbe0c4', '#dae6e9', '#faecd9', '#d3de7b', '#c3272b', '#bc012e', '#f07f5e', '#c90b42', '#beb29a', '#cf3a24', '#983fb2', '#fa7b62', '#b0e313', '#601ef9', '#e12120', '#871646', '#a32638', '#e9e3d2', '#f0debd', '#dfd4bf', '#f3e7db', '#5500ff', '#81585b', '#8e8c97', '#ffae52', '#ca9234', '#939b71', '#ec0003', '#2ce335', '#dadad1', '#6da9d2', '#bcbebc', '#7e9ec2', '#ecf0e5', '#05472a', '#cddced', '#bae3eb', '#cc0001', '#38546e', '#4f5845', '#e1dacb', '#fbeee5', '#cca47e', '#e7cf8c', '#aaa492', '#7a4b49', '#954e2c', '#f1ceb3', '#4d7eaa', '#9a9eb3', '#db9785', '#ff8f73', '#fcefc1', '#bcd9dc', '#767853', '#598c74', '#416082', '#a55232', '#78ad6d', '#546940', '#b7b59f', '#80365a', '#8da98d', '#93dfb8', '#983d53', '#54ac68', '#21c36f', '#479784', '#fc5a50', '#00859c', '#c1dbec', '#f7f2e1', '#00a465', '#008778', '#d4cbc4', '#c2ced2'
   ];
@@ -1416,6 +1504,21 @@ function App() {
         }
       })
     ];
+  }, []);
+
+  // Клик в любом месте — снять выделение с первого раза (в т.ч. при клике по выделенному тексту)
+  const clickToDeselectExtension = useMemo(() => {
+    return EditorView.domEventHandlers({
+      mousedown(view, e) {
+        if (!view?.state?.selection?.main || e.button !== 0) return;
+        const { from, to } = view.state.selection.main;
+        if (from !== to) {
+          const pos = view.posAtCoords({ x: e.clientX, y: e.clientY });
+          const cursorPos = pos != null ? pos : from;
+          view.dispatch({ selection: EditorSelection.cursor(cursorPos) });
+        }
+      }
+    });
   }, []);
 
   // Мини-карта кода (minimap) - отключаем пока, так как требует сложной реализации
@@ -2433,6 +2536,63 @@ function App() {
     }
   }, []); // Только при монтировании
 
+  // Сохранение SQL вкладок и кода в localStorage (при перезапуске приложения)
+  const saveSqlToStorage = useCallback(() => {
+    try {
+      const t1 = tabs1.map(t => t.id === activeTab1 ? { ...t, code: code1 } : t);
+      const t2 = tabs2.map(t => t.id === activeTab2 ? { ...t, code: code2 } : t);
+      localStorage.setItem('codeforge_sql_tabs1', JSON.stringify(t1));
+      localStorage.setItem('codeforge_sql_tabs2', JSON.stringify(t2));
+      localStorage.setItem('codeforge_sql_activeTab1', activeTab1);
+      localStorage.setItem('codeforge_sql_activeTab2', activeTab2);
+      localStorage.setItem('codeforge_sql_schema', JSON.stringify({ tables: sqlTables, erdPositions }));
+    } catch (e) {
+      console.warn('Не удалось сохранить SQL:', e);
+    }
+  }, [tabs1, tabs2, activeTab1, activeTab2, code1, code2, sqlTables, erdPositions]);
+
+  useEffect(() => {
+    if (sqlMode) saveSqlToStorage();
+  }, [sqlMode, saveSqlToStorage]);
+
+  useEffect(() => {
+    const onBeforeUnload = () => {
+      if (sqlMode) {
+        try {
+          const t1 = tabs1.map(t => t.id === activeTab1 ? { ...t, code: code1 } : t);
+          const t2 = tabs2.map(t => t.id === activeTab2 ? { ...t, code: code2 } : t);
+          localStorage.setItem('codeforge_sql_tabs1', JSON.stringify(t1));
+          localStorage.setItem('codeforge_sql_tabs2', JSON.stringify(t2));
+          localStorage.setItem('codeforge_sql_activeTab1', activeTab1);
+          localStorage.setItem('codeforge_sql_activeTab2', activeTab2);
+          localStorage.setItem('codeforge_sql_schema', JSON.stringify({ tables: sqlTables, erdPositions }));
+        } catch (_) {}
+      }
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, [sqlMode, tabs1, tabs2, activeTab1, activeTab2, code1, code2, sqlTables, erdPositions]);
+
+  const loadSqlFromStorage = useCallback(() => {
+    try {
+      const raw1 = localStorage.getItem('codeforge_sql_tabs1');
+      const raw2 = localStorage.getItem('codeforge_sql_tabs2');
+      const t1 = raw1 ? JSON.parse(raw1) : null;
+      const t2 = raw2 ? JSON.parse(raw2) : null;
+      if (Array.isArray(t1) && t1.length > 0) {
+        return {
+          tabs1: t1,
+          tabs2: Array.isArray(t2) && t2.length > 0 ? t2 : [{ id: 'tab2-1', name: 'Схемы', code: '', output: '', language: 'javascript' }],
+          activeTab1: localStorage.getItem('codeforge_sql_activeTab1') || t1[0]?.id || 'tab1-1',
+          activeTab2: localStorage.getItem('codeforge_sql_activeTab2') || 'tab2-1'
+        };
+      }
+    } catch (e) {
+      console.warn('Не удалось загрузить SQL из localStorage:', e);
+    }
+    return null;
+  }, []);
+
   // Функции для работы с вкладками (single view)
   const createNewTab = useCallback(() => {
     const newTabId = `tab-${Date.now()}`;
@@ -2641,6 +2801,57 @@ function App() {
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [code, language, isRunning, formatCode, executeCode]);
+
+  // Ctrl+A — для Electron: execCommand + native Selection API
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (!(e.ctrlKey || e.metaKey) || e.key?.toLowerCase() !== 'a') return;
+      const el = document.activeElement;
+      if (!el?.closest?.('.cm-editor')) return;
+      const refs = [editorViewRef1, editorViewRef2, editorViewRef];
+      for (const r of refs) {
+        const v = r.current;
+        if (v?.dom?.contains(el)) {
+          e.preventDefault();
+          e.stopPropagation();
+          v.contentDOM.focus();
+          const len = v.state.doc.length;
+          v.dispatch({ selection: EditorSelection.create([EditorSelection.range(0, len)]) });
+          const sel = window.getSelection();
+          if (sel) {
+            sel.removeAllRanges();
+            const range = document.createRange();
+            range.selectNodeContents(v.contentDOM);
+            sel.addRange(range);
+          }
+          break;
+        }
+      }
+    };
+    document.addEventListener('keydown', handleKeyDown, true);
+    return () => document.removeEventListener('keydown', handleKeyDown, true);
+  }, []);
+
+  // Клик по выделенному тексту — снять выделение (без preventDefault, чтобы не ломать выделение мышкой)
+  useEffect(() => {
+    const handleMouseDown = (e) => {
+      if (e.button !== 0) return;
+      const el = e.target;
+      if (!el?.closest?.('.cm-editor')) return;
+      const refs = [editorViewRef1, editorViewRef2, editorViewRef];
+      for (const r of refs) {
+        const v = r.current;
+        const main = v?.state?.selection?.main;
+        if (main && main.from !== main.to && v.dom?.contains(el)) {
+          const pos = v.posAtCoords({ x: e.clientX, y: e.clientY });
+          v.dispatch({ selection: EditorSelection.cursor(pos != null ? pos : main.from) });
+          break;
+        }
+      }
+    };
+    document.addEventListener('mousedown', handleMouseDown, true);
+    return () => document.removeEventListener('mousedown', handleMouseDown, true);
+  }, []);
 
   // В SQL-режиме: таблицы обновляются ТОЛЬКО после выполнения запроса (executeCode1).
   // Динамическое обновление при вводе кода отключено по требованию пользователя —
@@ -3280,23 +3491,17 @@ function App() {
             className={`btn btn-secondary ${splitView ? 'active' : ''}`}
             onClick={() => {
               if (splitView) {
-                // Переключаемся с split view на single view
                 if (code1.trim() && code2.trim() && code1 !== code2) {
-                  // Если оба окна имеют разный код, показываем модальное окно
                   setShowWindowChoiceModal(true);
                 } else {
-                  // Если одно окно пустое или код одинаковый, просто переключаем
                   setCode(code1 || code2);
                   setOutput(output1 || output2);
                   setSplitView(false);
                 }
               } else {
-                // Переключаемся на два окна
                 if (tabs.length > 1) {
-                  // Если есть несколько вкладок, показываем модалку для выбора
                   setShowTabSplitModal(true);
                 } else {
-                  // Если одна вкладка, просто копируем код в оба окна
                   setCode1(code);
                   setCode2(code);
                   setTabs1([{ id: 'tab1-1', name: 'Вкладка 1', code: code, output: output, language: language }]);
@@ -3396,9 +3601,9 @@ function App() {
                               key={tab.id}
                               onClick={() => switchTab1(tab.id)}
                               style={{
-                                background: activeTab1 === tab.id ? '#0e639c' : 'transparent',
+                                background: activeTab1 === tab.id ? '#4C5866' : 'transparent',
                                 border: '1px solid #3e3e3e',
-                                color: '#d4d4d4',
+                                color: activeTab1 === tab.id ? '#ffffff' : '#d4d4d4',
                                 cursor: 'pointer',
                                 padding: '2px 8px',
                                 fontSize: '11px',
@@ -3475,23 +3680,18 @@ function App() {
                   <CodeMirror
                     value={code1}
                     theme={[getCurrentTheme(), customTheme]}
+                    editable={true}
                     extensions={[
                       getLanguageExtension1(), 
                       customHighlightStyle,
                       smartAutocomplete,
-                      enableTextSelection,
                       tabExtension,
+                      clickToDeselectExtension,
                       ...indentExtension,
                       ...enhancedBracketMatching,
                       ...minimapExtension,
                       keymap.of([
-                        {
-                          key: 'Mod-a',
-                          run: (view) => {
-                            selectAll(view);
-                            return true;
-                          }
-                        },
+                        { key: 'Mod-a', run: selectAll },
                         {
                           key: 'Mod-l',
                           run: (view) => {
@@ -3582,6 +3782,8 @@ function App() {
                       lineNumbers: true,
                       foldGutter: true,
                       dropCursor: false,
+                      drawSelection: true,
+                      defaultKeymap: true,
                       allowMultipleSelections: false,
                       indentOnInput: true,
                       bracketMatching: false, // Используем улучшенную версию
@@ -3596,7 +3798,7 @@ function App() {
               </div>
               <div 
                 className="output-resizer-vertical"
-                onMouseDown={() => setIsResizingVertical1(true)}
+                onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); setIsResizingVertical1(true); }}
               />
               <div className="output-container" style={{ flex: `0 0 ${outputHeight1}px`, minHeight: `${outputHeight1}px`, maxHeight: `${outputHeight1}px`, display: 'flex', flexDirection: 'column' }}>
                 <div className="output-header">
@@ -3692,18 +3894,9 @@ function App() {
                           )}
                         </div>
                       </div>
-                      <button
-                        className="btn btn-secondary"
-                        onClick={updateSqlTables}
-                        style={{ padding: '4px 12px', fontSize: '12px' }}
-                        title="Ещё раз разобрать CREATE TABLE из левого окна"
-                      >
-                        📊 Обновить
-                      </button>
-                    
                     </div>
                     <span className="editor-hint"></span>
-                    <details open style={{ marginTop: '12px', fontSize: '11px', color: '#858585', border: '1px solid #3e3e3e', borderRadius: '4px', padding: '6px 10px', background: '#1e1e1e' }}>
+                    <details style={{ marginTop: '12px', fontSize: '11px', color: '#858585', border: '1px solid #3e3e3e', borderRadius: '4px', padding: '6px 10px', background: '#1e1e1e' }}>
                       <summary style={{ cursor: 'pointer', fontWeight: 'bold', color: '#aaa' }}>Справка по режимам SQL</summary>
                       <ul style={{ margin: '6px 0 0 0', paddingLeft: '18px', lineHeight: 1.5 }}>
                         <li><strong>SQL (in-memory)</strong>: одна БД на сессию для всех вкладок — сначала выполните скрипт с CREATE TABLE (в любой вкладке), затем SELECT можно делать в любой вкладке. Нужен: <code>npm install sql.js</code></li>
@@ -4044,7 +4237,6 @@ function App() {
                       </div>
                         );
                       })()}
-                    )
                   </div>
                 </div>
               ) : (
@@ -4103,9 +4295,9 @@ function App() {
                                   key={tab.id}
                                   onClick={() => switchTab2(tab.id)}
                                   style={{
-                                    background: activeTab2 === tab.id ? '#0e639c' : 'transparent',
+                                    background: activeTab2 === tab.id ? '#4C5866' : 'transparent',
                                     border: '1px solid #3e3e3e',
-                                    color: '#d4d4d4',
+                                    color: activeTab2 === tab.id ? '#ffffff' : '#d4d4d4',
                                     cursor: 'pointer',
                                     padding: '2px 8px',
                                     fontSize: '11px',
@@ -4165,23 +4357,18 @@ function App() {
                         ref={editorRef2}
                         value={code2}
                         theme={[getCurrentTheme(), customTheme]}
+                        editable={true}
                         extensions={[
                           getLanguageExtension2(), 
                           customHighlightStyle,
                           smartAutocomplete,
-                          enableTextSelection,
                           tabExtension,
+                          clickToDeselectExtension,
                           ...indentExtension,
                           ...enhancedBracketMatching,
                           ...minimapExtension,
                           keymap.of([
-                            {
-                              key: 'Mod-a',
-                              run: (view) => {
-                                selectAll(view);
-                                return true;
-                              }
-                            },
+                            { key: 'Mod-a', run: selectAll },
                             {
                               key: 'Mod-l',
                               run: (view) => {
@@ -4269,6 +4456,8 @@ function App() {
                           lineNumbers: true,
                           foldGutter: true,
                           dropCursor: false,
+                          drawSelection: true,
+                          defaultKeymap: true,
                           allowMultipleSelections: false,
                           indentOnInput: true,
                           bracketMatching: false, // Используем улучшенную версию
@@ -4283,21 +4472,20 @@ function App() {
                   </div>
                   <div 
                     className="output-resizer-vertical"
-                    onMouseDown={() => setIsResizingVertical2(true)}
+                    onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); setIsResizingVertical2(true); }}
                   />
                   <div className="output-container" style={{ flex: `0 0 ${outputHeight2}px`, minHeight: `${outputHeight2}px`, maxHeight: `${outputHeight2}px`, display: 'flex', flexDirection: 'column' }}>
                     <div className="output-header">
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%' }}>
                         <span className="output-title">Результат выполнения (2)</span>
                         <div style={{ display: 'flex', gap: '8px' }}>
-                          <button 
+                          {/* <button 
                             className="btn btn-secondary"
                             onClick={clearCode2}
                             style={{ padding: '2px 8px', fontSize: '11px' }}
                             title="Очистить код"
                           >
-                            🗑️
-                          </button>
+                          </button> */}
                           <button 
                             className="btn btn-secondary"
                             onClick={clearOutput2}
@@ -4368,9 +4556,9 @@ function App() {
                             key={tab.id}
                             onClick={() => switchTab(tab.id)}
                             style={{
-                              background: activeTab === tab.id ? '#0e639c' : 'transparent',
+                              background: activeTab === tab.id ? '#4C5866' : 'transparent',
                               border: '1px solid #3e3e3e',
-                              color: '#d4d4d4',
+                              color: activeTab === tab.id ? '#ffffff' : '#d4d4d4',
                               cursor: 'pointer',
                               padding: '2px 8px',
                               fontSize: '11px',
@@ -4411,24 +4599,19 @@ function App() {
                 <CodeMirror
                   value={code}
                   theme={[getCurrentTheme(), customTheme]}
+                  editable={true}
                   extensions={[
                     getLanguageExtension(), 
                     customHighlightStyle,
                     smartAutocomplete,
-                    enableTextSelection,
                     tabExtension,
+                    clickToDeselectExtension,
                     ...indentExtension,
                     ...enhancedBracketMatching,
                     ...minimapExtension,
                     ...errorHighlightExtension,
                     keymap.of([
-                      {
-                        key: 'Mod-a',
-                        run: (view) => {
-                          selectAll(view);
-                          return true;
-                        }
-                      },
+                      { key: 'Mod-a', run: selectAll },
                       {
                         key: 'Mod-l',
                         run: (view) => {
@@ -4516,6 +4699,8 @@ function App() {
                     lineNumbers: true,
                     foldGutter: true,
                     dropCursor: false,
+                    drawSelection: true,
+                    defaultKeymap: true,
                     allowMultipleSelections: false,
                     indentOnInput: true,
                     bracketMatching: true,
@@ -4528,7 +4713,7 @@ function App() {
             </div>
             <div 
               className="output-resizer"
-              onMouseDown={() => setIsResizing(true)}
+              onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); setIsResizing(true); }}
             />
             <div className="output-container" style={{ width: `${outputWidth}px` }}>
               <div className="output-header">
@@ -4600,43 +4785,6 @@ function App() {
         </div>
       )}
 
-      {/* Мини-окно CREATE TABLE при клике на имя таблицы справа (код в редакторе не меняется) */}
-      {createTableModalTableName && (() => {
-        const table = sqlTables.find(t => t.name === createTableModalTableName);
-        const createTableSql = table ? generateCreateTable(table) : '';
-        return (
-          <div className="modal-overlay" onClick={() => setCreateTableModalTableName(null)}>
-            <div className="modal-content" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '640px', width: '90%', maxHeight: '80vh', display: 'flex', flexDirection: 'column' }}>
-              <h3 style={{ margin: '0 0 12px 0', color: '#d4d4d4' }}>CREATE TABLE «{createTableModalTableName}»</h3>
-              <p style={{ margin: '0 0 10px 0', fontSize: '12px', color: '#858585' }}>Запрос на создание таблицы</p>
-              <pre
-                style={{
-                  flex: 1,
-                  overflow: 'auto',
-                  margin: 0,
-                  padding: '12px',
-                  background: '#1e1e1e',
-                  border: '1px solid #3e3e3e',
-                  borderRadius: '4px',
-                  fontFamily: 'Consolas, Monaco, monospace',
-                  fontSize: '13px',
-                  color: '#d4d4d4',
-                  whiteSpace: 'pre-wrap',
-                  wordBreak: 'break-word'
-                }}
-              >
-                {createTableSql || '—'}
-              </pre>
-              <div className="modal-buttons" style={{ marginTop: '12px' }}>
-                <button className="btn btn-primary" onClick={() => setCreateTableModalTableName(null)}>
-                  Закрыть
-                </button>
-              </div>
-            </div>
-          </div>
-        );
-      })()}
-
       {/* Модальное окно разделения вкладок */}
       {showTabSplitModal && (
         <div className="modal-overlay" onClick={() => setShowTabSplitModal(false)}>
@@ -4683,30 +4831,24 @@ function App() {
               <button
                 className="btn btn-primary"
                 onClick={() => {
-                  // Получаем выбранные вкладки из чекбоксов
                   const checkboxes1 = Array.from(document.querySelectorAll('[data-window="1"]:checked'));
                   const checkboxes2 = Array.from(document.querySelectorAll('[data-window="2"]:checked'));
-                  
                   const tabs1Selected = checkboxes1.map(cb => {
                     const tabId = cb.getAttribute('data-tab-id');
                     const tab = tabs.find(t => t.id === tabId);
                     return tab ? { ...tab, id: `tab1-${Date.now()}-${tabId}` } : null;
                   }).filter(Boolean);
-                  
                   const tabs2Selected = checkboxes2.map(cb => {
                     const tabId = cb.getAttribute('data-tab-id');
                     const tab = tabs.find(t => t.id === tabId);
                     return tab ? { ...tab, id: `tab2-${Date.now()}-${tabId}` } : null;
                   }).filter(Boolean);
-                  
-                  // Если вкладки не выбраны, создаем пустые
                   if (tabs1Selected.length === 0) {
                     tabs1Selected.push({ id: 'tab1-1', name: 'Вкладка 1', code: '', output: '', language: language });
                   }
                   if (tabs2Selected.length === 0) {
                     tabs2Selected.push({ id: 'tab2-1', name: 'Вкладка 1', code: '', output: '', language: language });
                   }
-                  
                   setTabs1(tabs1Selected);
                   setTabs2(tabs2Selected);
                   setActiveTab1(tabs1Selected[0].id);
@@ -4731,6 +4873,43 @@ function App() {
           </div>
         </div>
       )}
+
+      {/* Мини-окно CREATE TABLE при клике на имя таблицы справа (код в редакторе не меняется) */}
+      {createTableModalTableName && (() => {
+        const table = sqlTables.find(t => t.name === createTableModalTableName);
+        const createTableSql = table ? generateCreateTable(table) : '';
+        return (
+          <div className="modal-overlay" onClick={() => setCreateTableModalTableName(null)}>
+            <div className="modal-content" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '640px', width: '90%', maxHeight: '80vh', display: 'flex', flexDirection: 'column' }}>
+              <h3 style={{ margin: '0 0 12px 0', color: '#d4d4d4' }}>CREATE TABLE «{createTableModalTableName}»</h3>
+              <p style={{ margin: '0 0 10px 0', fontSize: '12px', color: '#858585' }}>Запрос на создание таблицы</p>
+              <pre
+                style={{
+                  flex: 1,
+                  overflow: 'auto',
+                  margin: 0,
+                  padding: '12px',
+                  background: '#1e1e1e',
+                  border: '1px solid #3e3e3e',
+                  borderRadius: '4px',
+                  fontFamily: 'Consolas, Monaco, monospace',
+                  fontSize: '13px',
+                  color: '#d4d4d4',
+                  whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-word'
+                }}
+              >
+                {createTableSql || '—'}
+              </pre>
+              <div className="modal-buttons" style={{ marginTop: '12px' }}>
+                <button className="btn btn-primary" onClick={() => setCreateTableModalTableName(null)}>
+                  Закрыть
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 }

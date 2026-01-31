@@ -54,12 +54,12 @@
 
 .language-select:hover {
   background: #3e3e3e;
-  border-color: #4fc3f7;
+  border-color: #7a8a9a;
 }
 
 .language-select:focus {
-  border-color: #4fc3f7;
-  box-shadow: 0 0 0 2px rgba(79, 195, 247, 0.2);
+  border-color: #7a8a9a;
+  box-shadow: 0 0 0 2px rgba(76, 88, 102, 0.3);
 }
 
 .btn {
@@ -77,12 +77,12 @@
 }
 
 .btn-primary {
-  background: #0e639c;
+  background: #4C5866;
   color: #ffffff;
 }
 
 .btn-primary:hover:not(:disabled) {
-  background: #1177bb;
+  background: #3D4852;
   transform: translateY(-1px);
   box-shadow: 0 2px 8px rgba(14, 99, 156, 0.3);
 }
@@ -117,13 +117,13 @@
 
 .btn-secondary:hover {
   background: #3e3e3e;
-  border-color: #4fc3f7;
-  color: #4fc3f7;
+  border-color: #7a8a9a;
+  color: #ffffff;
 }
 
 .btn-secondary.active {
-  background: #0e639c;
-  border-color: #0e639c;
+  background: #4C5866;
+  border-color: #4C5866;
   color: #ffffff;
 }
 
@@ -289,8 +289,7 @@
   position: relative;
   flex-shrink: 0;
   overflow: hidden;
-  height: fit-content;
-  max-height: 100%;
+  height: 100%;
 }
 
 /* В split view панель вывода должна занимать всю доступную высоту */
@@ -307,10 +306,13 @@
   position: relative;
   flex-shrink: 0;
   z-index: 10;
+  user-select: none;
+  -webkit-user-select: none;
+  pointer-events: auto;
 }
 
 .output-resizer:hover {
-  background: #4fc3f7;
+  background: #5E6D7B;
 }
 
 .output-resizer::before {
@@ -320,7 +322,7 @@
   top: 0;
   bottom: 0;
   width: 2px;
-  background: #4fc3f7;
+  background: #5E6D7B;
   transform: translateX(-50%);
   opacity: 0;
   transition: opacity 0.2s;
@@ -351,7 +353,7 @@
 
 .output-content {
   padding: 12px;
-  overflow-y: visible;
+  overflow-y: auto;
   overflow-x: hidden;
   font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
   font-size: 13px;
@@ -360,6 +362,8 @@
   white-space: pre-wrap;
   word-wrap: break-word;
   background: #1e1e1e;
+  flex: 1;
+  min-height: 0;
 }
 
 .output-content pre {
@@ -521,13 +525,13 @@
 
 .setting-group select:hover,
 .setting-group input:hover {
-  border-color: #4fc3f7;
+  border-color: #5E6D7B;
 }
 
 .setting-group select:focus,
 .setting-group input:focus {
-  border-color: #4fc3f7;
-  box-shadow: 0 0 0 2px rgba(79, 195, 247, 0.2);
+  border-color: #5E6D7B;
+  box-shadow: 0 0 0 2px rgba(76, 88, 102, 0.3);
 }
 
 .color-picker {
@@ -549,14 +553,14 @@
 
 .color-option:hover {
   transform: scale(1.1);
-  border-color: #4fc3f7;
-  box-shadow: 0 0 8px rgba(79, 195, 247, 0.4);
+  border-color: #5E6D7B;
+  box-shadow: 0 0 8px rgba(76, 88, 102, 0.4);
 }
 
 .color-option.active {
-  border-color: #4fc3f7;
+  border-color: #5E6D7B;
   border-width: 3px;
-  box-shadow: 0 0 12px rgba(79, 195, 247, 0.6);
+  box-shadow: 0 0 12px rgba(76, 88, 102, 0.5);
 }
 
 /* Split view */
@@ -635,7 +639,7 @@
 }
 
 .split-divider:hover {
-  background: #4fc3f7;
+  background: #5E6D7B;
 }
 
 .split-divider::before {
@@ -645,7 +649,7 @@
   top: 0;
   bottom: 0;
   width: 2px;
-  background: #4fc3f7;
+  background: #5E6D7B;
   transform: translateX(-50%);
   opacity: 0;
   transition: opacity 0.2s;
@@ -665,7 +669,7 @@
 }
 
 .split-resizer:hover {
-  background: #4fc3f7;
+  background: #5E6D7B;
 }
 
 .split-resizer::before {
@@ -675,7 +679,7 @@
   top: 0;
   bottom: 0;
   width: 2px;
-  background: #4fc3f7;
+  background: #5E6D7B;
   transform: translateX(-50%);
   opacity: 0;
   transition: opacity 0.2s;
@@ -692,10 +696,13 @@
   cursor: row-resize;
   position: relative;
   flex-shrink: 0;
+  user-select: none;
+  -webkit-user-select: none;
+  pointer-events: auto;
 }
 
 .output-resizer-vertical:hover {
-  background: #4fc3f7;
+  background: #5E6D7B;
 }
 
 .output-resizer-vertical::before {
@@ -705,7 +712,7 @@
   left: 0;
   right: 0;
   height: 2px;
-  background: #4fc3f7;
+  background: #5E6D7B;
   transform: translateY(-50%);
   opacity: 0;
   transition: opacity 0.2s;
@@ -767,7 +774,7 @@
   }
 }
 
-/* Мини-карта кода */
+/* Мини-карта кода — не перехватывать клики, чтобы выделение мышью работало */
 .cm-minimap {
   position: absolute;
   right: 0;
@@ -777,7 +784,7 @@
   background: #1e1e1e;
   border-left: 1px solid #3e3e3e;
   overflow: hidden;
-  pointer-events: auto;
+  pointer-events: none;
   z-index: 100;
   font-size: 1px;
   line-height: 1px;
@@ -787,14 +794,48 @@
   position: relative;
 }
 
+/* Выделение мышью и Ctrl+A */
+.cm-editor,
+.cm-editor *,
+.cm-editor .cm-scroller,
+.cm-editor .cm-content,
+.cm-editor .cm-content *,
+.cm-editor .cm-line {
+  user-select: text !important;
+  -webkit-user-select: text !important;
+  pointer-events: auto !important;
+}
+
+/* CodeMirror selection layer */
+.cm-editor .cm-selectionLayer {
+  z-index: 10 !important;
+  pointer-events: none !important;
+}
+/* Выделение — нейтральный серый, текст читаемый */
+.cm-editor .cm-selectionBackground,
+.cm-editor .cm-selectionLayer .cm-selectionBackground {
+  background-color: rgba(128, 128, 128, 0.35) !important;
+}
+
+.cm-editor .cm-content::selection,
+.cm-editor .cm-line ::selection {
+  background: rgba(128, 128, 128, 0.35) !important;
+  color: inherit !important;
+}
+.cm-editor .cm-content::-moz-selection,
+.cm-editor .cm-line ::-moz-selection {
+  background: rgba(128, 128, 128, 0.35) !important;
+  color: inherit !important;
+}
+
 .cm-editor:has(.cm-minimap) .cm-scroller {
   padding-right: 80px;
 }
 
 /* Улучшенная подсветка парных скобок */
 .cm-matchingBracket {
-  background-color: rgba(79, 195, 247, 0.3) !important;
-  outline: 1px solid rgba(79, 195, 247, 0.5) !important;
+  background-color: rgba(86, 211, 100, 0.3) !important;
+  outline: 1px solid rgba(86, 211, 100, 0.5) !important;
   border-radius: 2px;
 }
 
