@@ -1,0 +1,29 @@
+appId: com.codeforgestudio.app
+productName: CodeForge Studio
+directories:
+  buildResources: build
+files:
+  - build/**/*
+  - package.json
+# CodeMirror не требует распаковки из asar
+extraMetadata:
+  main: build/electron.js
+win:
+  icon: icon.ico
+  target: 
+    - target: nsis
+      arch:
+        - x64
+  requestedExecutionLevel: asInvoker
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: CodeForge Studio
+  artifactName: ${productName}-${version}-setup.${ext}
+mac:
+  target: dmg
+linux:
+  target: AppImage
+

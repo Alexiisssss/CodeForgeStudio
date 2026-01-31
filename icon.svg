@@ -1,0 +1,21 @@
+<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg">
+  <!-- Фон -->
+  <rect width="256" height="256" rx="20" fill="#1e1e1e"/>
+  
+  <!-- Код символы -->
+  <g fill="none" stroke="#4fc3f7" stroke-width="8" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Левая скобка -->
+    <path d="M 80 60 L 60 128 L 80 196"/>
+    <!-- Правая скобка -->
+    <path d="M 176 60 L 196 128 L 176 196"/>
+    <!-- Символы кода -->
+    <path d="M 100 100 L 128 128 L 100 156"/>
+    <path d="M 156 100 L 128 128 L 156 156"/>
+  </g>
+  
+  <!-- Точки (как в коде) -->
+  <circle cx="128" cy="80" r="6" fill="#4fc3f7"/>
+  <circle cx="128" cy="128" r="6" fill="#4fc3f7"/>
+  <circle cx="128" cy="176" r="6" fill="#4fc3f7"/>
+</svg>
+
