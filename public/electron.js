@@ -283,7 +283,8 @@ ipcMain.handle('execute-python', async (event, code) => {
     }, 30000);
     
     const python = spawn('python', ['-u', tempFile], {
-      encoding: 'utf8'
+      encoding: 'utf8',
+      env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' }
     });
     let output = '';
     let error = '';
@@ -846,9 +847,13 @@ ipcMain.handle('execute-cpp', async (event, code) => {
     exec(`${compiler} "${tempFile}" -o "${exeFile}"`, (compileError, compileStdout, compileStderr) => {
       if (compileError) {
         fs.unlinkSync(tempFile);
-        resolve({
-          error: `Ошибка компиляции:\n${compileStderr}\n\nУбедитесь, что компилятор C++ (g++ или clang) установлен и доступен в PATH.`
-        });
+        const stderr = (compileStderr || '').trim();
+        const isCompilerNotFound = compileError.code === 'ENOENT' ||
+          (!/error:/i.test(stderr) && (stderr.length < 300 || /not recognized|не является|not found|not found in/i.test(stderr)));
+        const message = isCompilerNotFound
+          ? 'Компилятор g++ не найден.\n\nУстановите один из вариантов:\n• MinGW-w64: https://www.mingw-w64.org/\n• MSYS2: https://www.msys2.org/ (пакет mingw-w64-toolchain)\n\nПосле установки добавьте папку bin компилятора в переменную PATH.'
+          : `Ошибка компиляции:\n${stderr}\n\nУбедитесь, что компилятор C++ (g++ или clang) установлен и доступен в PATH.`;
+        resolve({ error: message });
         return;
       }
       

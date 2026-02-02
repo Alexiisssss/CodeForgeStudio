@@ -44,7 +44,16 @@ function App() {
   const [showClassNameColor, setShowClassNameColor] = useState(false);
   const [showVariableColor, setShowVariableColor] = useState(false);
   const [showBackgroundColor, setShowBackgroundColor] = useState(false);
+  const [useCustomSyntaxColors, setUseCustomSyntaxColors] = useState(() => {
+    try {
+      return localStorage.getItem('codeforge_use_custom_syntax') === 'true';
+    } catch (e) {
+      return false;
+    }
+  });
   const [showHotkeys, setShowHotkeys] = useState(true);
+  const [showThemeDropdown, setShowThemeDropdown] = useState(false);
+  const themeDropdownRef = useRef(null);
   const [tabs, setTabs] = useState([{ id: 'tab-1', name: 'Вкладка 1', code: '', output: '', language: 'javascript' }]); // Вкладки для single view: [{id, name, code, output, language}]
   const [activeTab, setActiveTab] = useState('tab-1');
   const [autoSaveEnabled, setAutoSaveEnabled] = useState(true);
@@ -128,6 +137,8 @@ function App() {
   const editorViewRef2 = useRef(null);
   const splitDividerRef = useRef(null);
   const editorViewRef = useRef(null);
+  const createNewTabLockRef = useRef(0); // время последнего создания вкладки (для защиты от двойного клика)
+  const CREATE_TAB_COOLDOWN_MS = 400;
   // In-memory SQLite (sql.js) для выполнения SQL
   const sqlJsDbRef = useRef(null);
   const sqlJsInitPromiseRef = useRef(null);
@@ -146,6 +157,81 @@ function App() {
     { value: 'html', label: 'HTML' },
     { value: 'css', label: 'CSS' },
   ];
+
+  const autoDetectTimerRef = useRef(null);
+  const skipAutoDetectUntilRef = useRef(0); // после выхода из SQL не определять язык по коду 800 мс
+  const AUTO_DETECT_DEBOUNCE_MS = 1200;
+  const MIN_CODE_LENGTH_FOR_DETECT = 25;
+
+  // Автоопределение языка по содержимому кода (для обычного режима)
+  const detectLanguageFromCode = useCallback((text) => {
+    if (!text || text.trim().length < MIN_CODE_LENGTH_FOR_DETECT) return null;
+    const s = text.trim();
+    const scores = {};
+    // Java
+    let javaScore = (s.match(/\b(public\s+class|private\s+|protected\s+|void\s+main\s*\(|import\s+java\.|package\s+[\w.]+;|@Override|String\[\])\b/g) || []).length +
+      (s.match(/\b(List<|Map<|Set<|ArrayList|HashMap|Integer|Long|Boolean|System\.out|Scanner|throws\s+\w+)\b/g) || []).length;
+    if (/\bimport\s+java\./.test(s) || /\bpackage\s+[\w.]+\s*;/.test(s)) javaScore += 10;
+    if (javaScore >= 1) scores.java = javaScore;
+    // JavaScript/TypeScript (const/let не считаем за JS, если есть признаки C++ — #include, std::)
+    const isLikelyCpp = /#include\s*[<"]|\bstd::/.test(s);
+    const jsBase = (s.match(/\b(=>|function\s*\(|import\s+.*\s+from|export\s+default|console\.log|\.then\s*\(|async\s+)\b/g) || []).length +
+      (s.match(/\b(for\s+const\s+|new\s+Map\s*\(|Array\.from|\.filter\s*\(|\.map\s*\(|\.sort\s*\(|\.slice\s*\()/g) || []).length;
+    const jsConstLet = isLikelyCpp ? 0 : (s.match(/\b(const\s+|let\s+)\b/g) || []).length;
+    const jsScore = jsBase + jsConstLet;
+    if (jsScore >= 1) scores.javascript = jsScore;
+    const tsScore = (s.match(/\b(interface\s+\w+|type\s+\w+\s*=|:\s*(string|number|boolean|void)\b|as\s+)\b/g) || []).length +
+      (s.match(/\b(enum\s+\w+|readonly\s+|\.\?\w+|:\s*\w+\[\])\b/g) || []).length +
+      (s.match(/\?\?|\b(Promise|Array|Map|Set)<\w*>/g) || []).length;
+    if (tsScore >= 1) scores.typescript = (scores.javascript || 0) + tsScore;
+    // Python (import без скобки — иначе совпадает с Go "import (")
+    const pyKeywords = (s.match(/\b(def\s+\w+\s*\(|class\s+\w+|from\s+.*\s+import|if\s+__name__|print\s*\(|elif\s+)\b/g) || []).length +
+      (s.match(/\bimport\s+[a-zA-Z_][a-zA-Z0-9_]*\b/g) || []).length;
+    // Отступы в 4 пробела считаем за Python только если уже есть явные признаки Python (иначе JS/другие тоже так форматируют)
+    const pyIndent = pyKeywords >= 1 ? (s.match(/\n\s{4}\w/g) || []).length : 0;
+    const pyScore = pyKeywords + pyIndent;
+    if (pyScore >= 1) scores.python = pyScore;
+    // C++
+    let cppScore = (s.match(/#include|int\s+main\s*\(|std::|cout|cin|namespace\s+/g) || []).length +
+      (s.match(/\b(struct\s+\w+|static_cast|std::vector|std::map|std::string|std::sort)\b/g) || []).length;
+    if (/#include\s*[<"]/.test(s)) cppScore += 15; // явный признак C/C++ — приоритет над JS (const)
+    if (cppScore >= 1) scores.cpp = cppScore;
+    // C#
+    let csScore = (s.match(/\b(using\s+System|namespace\s+\w+|void\s+Main\s*\(|Console\.|public\s+class)\b/g) || []).length +
+      (s.match(/\b(List<>|Dictionary<>|var\s+\w+\s*=|foreach\s*\(|get;\s*set;|\[\w+\]\s*public)\b/g) || []).length;
+    if (/\busing\s+System\b/.test(s) || /\bnamespace\s+\w+\s*\{/.test(s)) csScore += 10;
+    if (csScore >= 1) scores.csharp = csScore;
+    // Go: package main, import (, :=, func (receiver), make(, fmt., time., range, []Type
+    let goScore =
+      (s.match(/\b(package\s+main|func\s+main\s*\(|import\s*\(|:=)\b/g) || []).length +
+      (s.match(/\b(func\s+\(|make\s*\(|fmt\.|time\.|range\s+)\b/g) || []).length +
+      (s.match(/\[\]\w+/g) || []).length;
+    // Явный признак Go — приоритет над Python (у которого много очков за отступы)
+    if (/\bpackage\s+main\b/.test(s)) goScore += 15;
+    if (goScore >= 1) scores.go = goScore;
+    // HTML
+    const htmlScore = (s.match(new RegExp('<!DOCTYPE|<html|<head|<body|<meta\\s|<link\\s|<img\\s|<a\\s|</div>|<div\\s|</span>|<span\\s|</script>|<script|</style>|<style\\s|</head>|</body>', 'gi')) || []).length;
+    if (htmlScore >= 1) scores.html = htmlScore;
+    // CSS
+    const cssScore = (s.match(/\.[a-zA-Z_-]+\s*\{|#[a-fA-F0-9]+\s*\{|margin\s*:|padding\s*:|@media|@keyframes|display\s*:|width\s*:|height\s*:|background\s*:|border\s*:|font-size\s*:|flex|grid\s/g) || []).length;
+    if (cssScore >= 2) scores.css = cssScore;
+    const maxScore = Math.max(...Object.values(scores), 0);
+    if (maxScore < 1) return null;
+    const best = Object.entries(scores).find(([, v]) => v === maxScore);
+    return best ? best[0] : null;
+  }, []);
+
+  // Автоопределение SQL-диалекта (Postgres vs Oracle vs SQLite)
+  const detectSqlDialectFromCode = useCallback((text) => {
+    if (!text || text.trim().length < 15) return null;
+    const s = text.toUpperCase();
+    let pg = 0, ora = 0;
+    if (/\bSERIAL\b/.test(s) || /\bRETURNING\b/.test(s) || /\b::\s*(\w+)/.test(text) || /\bBOOLEAN\b/.test(s)) pg++;
+    if (/\bNVL\s*\(/.test(s) || /\bDUAL\b/.test(s) || /\bVARCHAR2\b/.test(s) || /\bNUMBER\s*\(/.test(s) || /\bROWNUM\b/.test(s)) ora++;
+    if (ora > pg) return 'oracle';
+    if (pg > ora) return 'postgres';
+    return null;
+  }, []);
 
   // Простенький парсер CREATE TABLE для вывода списка таблиц справа в SQL-режиме
   const parseSqlTablesFromCode = (source) => {
@@ -286,7 +372,7 @@ function App() {
 
   // Препроцессинг одного оператора для SQLite (ENUM, BOOLEAN, CREATE TYPE и т.д.)
   const preprocessSqlStatement = useCallback((stmt) => {
-    let s = stmt
+    let s = String(stmt ?? '')
       .replace(/\bCREATE\s+TABLE\s+(?!IF\s+NOT\s+EXISTS)/gi, 'CREATE TABLE IF NOT EXISTS ')
       .replace(/\bINT\s+PRIMARY\s+KEY\s+AUTO_INCREMENT\b/gi, 'INTEGER PRIMARY KEY AUTOINCREMENT')
       .replace(/\bAUTO_INCREMENT\b/gi, 'AUTOINCREMENT')
@@ -314,29 +400,43 @@ function App() {
 
   // Выполнение SQL в in-memory SQLite: CREATE, INSERT, SELECT, JOIN и т.д.
   const runSqlInMemory = useCallback(async (codeText) => {
+    // Отладка: что пришло в runSqlInMemory
+    console.log('[runSqlInMemory] typeof codeText:', typeof codeText);
+    console.log('[runSqlInMemory] codeText (sample):', typeof codeText === 'string' ? codeText.slice(0, 200) : codeText);
+    const raw = String(codeText ?? '');
+    console.log('[runSqlInMemory] raw (sample):', raw.slice(0, 200));
+    if (raw.includes('[object Object]')) {
+      console.error('[runSqlInMemory] ОШИБКА: в SQL попал "[object Object]" — codeText был объектом');
+    }
     // Удаляем однострочные комментарии (-- до конца строки), чтобы точка с запятой в комментарии не ломала разбор
-    let sql = (codeText || '').replace(/^\s*--[^\n]*/gm, '\n');
+    let sql = raw.replace(/^\s*--[^\n]*/gm, '\n');
     sql = preprocessSqlStatement(sql);
 
     const db = await getOrCreateSqlDb();
-    const statements = sql.split(';').map((s) => s.trim()).filter(Boolean);
+    const statements = sql.split(';').map((s) => String(s).trim()).filter(Boolean);
+    console.log('[runSqlInMemory] statements.length:', statements.length, 'first stmt (sample):', statements[0]?.slice(0, 100));
     const outputLines = [];
     let lastSelectResult = null;
     let hadSelect = false;
 
     for (let i = 0; i < statements.length; i++) {
-      let stmt = statements[i] + ';';
+      let stmt = String(statements[i] ?? '') + ';';
       stmt = preprocessSqlStatement(stmt);
+      stmt = String(stmt ?? '');
+      if (stmt.includes('[object Object]')) {
+        console.error('[runSqlInMemory] stmt содержит "[object Object]" для i=', i, 'stmt (sample):', stmt.slice(0, 150));
+      }
       const upper = stmt.toUpperCase();
       try {
         if (/^\s*CREATE\s+TYPE\b/i.test(stmt)) {
-          outputLines.push('CREATE TYPE пропущен (SQLite не поддерживает, тип заменён на TEXT).');
+          outputLines.push('CREATE TYPE пропущен: это конструкция PostgreSQL (ENUM). Режим «SQL (in-memory)» использует SQLite, который не поддерживает CREATE TYPE.');
+          outputLines.push('Чтобы выполнить этот оператор — выберите диалект «PostgreSQL» и настройте подключение к своей БД.');
           outputLines.push('');
           continue;
         }
         if (upper.includes('SELECT')) {
           hadSelect = true;
-          const result = db.exec(stmt);
+          const result = db.exec(String(stmt));
           lastSelectResult = result;
           if (result.length > 0 && result[0].columns) {
             const { columns } = result[0];
@@ -361,7 +461,9 @@ function App() {
             outputLines.push('');
           }
         } else {
-          db.run(stmt);
+          const sqlToRun = String(stmt);
+          console.log('[runSqlInMemory] db.run typeof:', typeof sqlToRun, 'length:', sqlToRun.length, 'start:', sqlToRun.slice(0, 80));
+          db.run(sqlToRun);
           saveSqlDbToStorage();
           if (upper.includes('CREATE TABLE')) outputLines.push(upper.includes('IF NOT EXISTS') ? 'CREATE TABLE выполнено (или уже существовала).' : 'CREATE TABLE выполнено.');
           else if (upper.includes('INSERT')) outputLines.push('INSERT выполнено.');
@@ -453,7 +555,7 @@ function App() {
 
   // Загрузка содержимого таблицы по кнопке справа (SELECT * FROM table_name)
   const loadTableData = useCallback(async (tableName) => {
-    setSqlTableDataView(null);
+    setSqlTableDataView({ tableName, columns: [], rows: [], loading: true });
     try {
       if (sqlDialect === 'sql') {
         const db = await getOrCreateSqlDb();
@@ -483,6 +585,31 @@ function App() {
       console.warn('loadTableData:', err);
     }
   }, [sqlDialect, getOrCreateSqlDb, postgresConn, oracleConn, ipcRenderer]);
+
+  // Синхронизация списка таблиц справа с реальной in-memory БД (диалект SQL)
+  const syncSqlTablesFromDb = useCallback(async () => {
+    if (sqlDialect !== 'sql') return;
+    try {
+      const db = await getOrCreateSqlDb();
+      const tableNames = db.exec("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'");
+      const tables = [];
+      if (tableNames.length > 0 && tableNames[0].values) {
+        for (const [name] of tableNames[0].values) {
+          const info = db.exec(`PRAGMA table_info("${String(name).replace(/"/g, '""')}")`);
+          const columns = (info[0] && info[0].values) ? info[0].values.map((row) => ({
+            name: row[1],
+            type: row[2] || '',
+            isPrimaryKey: row[5] === 1,
+            isNotNull: row[3] === 1,
+            isUnique: false
+          })) : [];
+          tables.push({ name, columns });
+        }
+      }
+      setSqlTables(tables);
+      setSqlTableDataView(null);
+    } catch (_) {}
+  }, [sqlDialect, getOrCreateSqlDb]);
 
   // Генерируем CREATE TABLE запрос для таблицы (используем оригинальный SQL если есть)
   const generateCreateTable = (table) => {
@@ -570,6 +697,13 @@ function App() {
           }
         } catch (_) {}
       }
+      // Postgres/Oracle без подключения — не показывать старые таблицы из localStorage
+      const pgNoConn = sqlDialect === 'postgres' && (!(postgresConn.user || '').trim() || !(postgresConn.database || '').trim());
+      const oraNoConn = sqlDialect === 'oracle' && (!(oracleConn.user || '').trim() || !(oracleConn.connectString || '').trim());
+      if (pgNoConn || oraNoConn) {
+        schemaTables = [];
+        schemaErd = {};
+      }
       if (schemaTables && schemaTables.length > 0) {
         setSqlTables(schemaTables);
         setSqlTableDataView(schema.tableDataView);
@@ -633,6 +767,8 @@ function App() {
       const targetLang = langBeforeSqlRef.current != null ? langBeforeSqlRef.current : (splitView ? language1 : language);
       const savedForLang = tabsByLanguageRef.current[targetLang];
 
+      skipAutoDetectUntilRef.current = Date.now() + 800;
+
       if (savedForLang) {
         if (savedForLang.tabs1 && savedForLang.tabs1.length > 0) {
           setTabs1(savedForLang.tabs1);
@@ -653,8 +789,9 @@ function App() {
         }
       } else {
         setCode('');
-        setTabs([{ id: 'tab-1', name: 'Вкладка 1', code: '', output: '', language: language }]);
+        setTabs([{ id: 'tab-1', name: 'Вкладка 1', code: '', output: '', language: targetLang }]);
         setActiveTab('tab-1');
+        setLanguage(targetLang);
         setSplitView(false);
       }
 
@@ -758,8 +895,9 @@ function App() {
     }, { dark: colors.dark || false });
   };
 
-  // Доступные темы CodeMirror
+  // Доступные темы CodeMirror (customTheme = цвета из панели «Настройки цветов»)
   const availableThemes = [
+    { value: 'customTheme', label: 'По настройкам', theme: oneDark },
     { value: 'enderTheme', label: 'Ender Theme', theme: createTheme('enderTheme', {
       background: '#0d1117', foreground: '#c9d1d9', gutterBg: '#161b22', gutterFg: '#6e7681',
       cursor: '#58a6ff', selection: '#264f78', border: '#30363d', dark: true
@@ -1247,25 +1385,21 @@ function App() {
   const customHighlightStyle = useMemo(() => {
     const styleRules = [];
     
-    // Получаем цвета из темы или используем пользовательские настройки
+    // Для «По настройкам», Ender, One Dark — цвета из панели; если включено «свои цвета поверх темы» — всегда из панели
     const themeColors = getThemeSyntaxColors(selectedTheme);
-    const useThemeColors = selectedTheme !== 'enderTheme' && selectedTheme !== 'oneDark';
+    const themeObj = availableThemes.find(t => t.value === selectedTheme);
+    const usePanelSyntax = useCustomSyntaxColors || selectedTheme === 'customTheme' || selectedTheme === 'enderTheme' || selectedTheme === 'oneDark';
     
-    // Для SQL-режима используем мягкие тёплые жёлтоватые оттенки
     const isSqlMode = sqlMode === true;
-    // Очень мягкий, светлый жёлтый для ключевых слов и общего акцента
     const sqlKeywordColor = '#f6e6a9';
-    // Чуть более тёплый жёлтый для имён функций / типов
     const sqlFunctionColor = '#f3dea0';
-    // Мягкий светло-жёлтый для переменных / идентификаторов
     const sqlVariableColor = '#f2e3b5';
-    // Светлый жёлто-кремовый для строк
     const sqlStringColor = '#f7f0c5';
     
-    const finalKeywordColor = isSqlMode ? sqlKeywordColor : (useThemeColors ? themeColors.keyword : keywordColor);
-    const finalClassNameColor = isSqlMode ? sqlFunctionColor : (useThemeColors ? themeColors.className : classNameColor);
-    const finalVariableColor = isSqlMode ? sqlVariableColor : (useThemeColors ? themeColors.variable : variableColor);
-    const finalFunctionColor = isSqlMode ? sqlFunctionColor : (useThemeColors ? themeColors.function : classNameColor);
+    const finalKeywordColor = isSqlMode ? sqlKeywordColor : (usePanelSyntax ? keywordColor : themeColors.keyword);
+    const finalClassNameColor = isSqlMode ? sqlFunctionColor : (usePanelSyntax ? classNameColor : themeColors.className);
+    const finalVariableColor = isSqlMode ? sqlVariableColor : (usePanelSyntax ? variableColor : themeColors.variable);
+    const finalFunctionColor = isSqlMode ? sqlFunctionColor : (usePanelSyntax ? classNameColor : (themeColors.function ?? themeColors.className));
     
     // Ключевые слова (new, class, function, if, else, public, static, private, final, etc)
     if (tags.keyword) styleRules.push({ tag: tags.keyword, color: finalKeywordColor });
@@ -1289,14 +1423,13 @@ function App() {
     // Операторы - цвет ключевых слов
     if (tags.operator) styleRules.push({ tag: tags.operator, color: finalKeywordColor });
     
-    // Скобки и пунктуация - цвет текста темы
-    const themeObj = availableThemes.find(t => t.value === selectedTheme);
-    const bracketColor = useThemeColors ? (themeObj?.theme?.spec?.foreground || fontColor) : '#c9d1d9';
+    // Скобки и пунктуация - в SQL мягкий жёлтый, иначе цвет текста из настроек или темы
+    const bracketColor = isSqlMode ? sqlVariableColor : (themeObj?.theme?.spec?.foreground || fontColor);
     if (tags.bracket) styleRules.push({ tag: tags.bracket, color: bracketColor });
     if (tags.punctuation) styleRules.push({ tag: tags.punctuation, color: bracketColor });
     
-    // Строки - мягкий желтоватый для SQL, светло-синий для остальных языков
-    const stringColor = isSqlMode ? sqlStringColor : '#a5d6ff';
+    // Строки — из темы или дефолт
+    const stringColor = isSqlMode ? sqlStringColor : (usePanelSyntax ? '#a5d6ff' : (themeColors.string ?? '#a5d6ff'));
     if (tags.string) styleRules.push({ tag: tags.string, color: stringColor });
     if (tags.string2) styleRules.push({ tag: tags.string2, color: stringColor });
     
@@ -1318,7 +1451,7 @@ function App() {
     const highlightStyle = HighlightStyle.define(styleRules);
     // Обертываем в syntaxHighlighting для использования как расширение
     return syntaxHighlighting(highlightStyle);
-  }, [keywordColor, classNameColor, variableColor, selectedTheme, fontColor, getThemeSyntaxColors, availableThemes, sqlMode]);
+  }, [keywordColor, classNameColor, variableColor, selectedTheme, fontColor, getThemeSyntaxColors, availableThemes, sqlMode, useCustomSyntaxColors]);
 
   // Ключевые слова для разных языков
   const languageKeywords = useMemo(() => {
@@ -1542,29 +1675,28 @@ function App() {
     return [];
   }, [showMinimap]);
 
-  // Создаем кастомную тему с настройками шрифта (Ender Theme стиль)
+  // Кастомная тема: только шрифт и размер. Цвет текста — только для «По настройкам»/Ender/One Dark, иначе берётся из выбранной темы
   const customTheme = useMemo(() => {
     const isEnderTheme = selectedTheme === 'enderTheme';
+    const usePanelTextColor = selectedTheme === 'customTheme' || selectedTheme === 'enderTheme' || selectedTheme === 'oneDark';
     const isSqlMode = sqlMode === true;
-    const sqlTextColor = '#f6e6a9'; // мягкий светло-жёлтый для текста SQL
+    const sqlTextColor = '#f2e3b5';
+    const contentStyle = {
+      fontSize: `${fontSize}px`,
+      fontFamily: isEnderTheme ? 'JetBrains Mono, Consolas, monospace' : fontFamily,
+      fontStyle: fontStyle,
+    };
+    if (usePanelTextColor || isSqlMode) {
+      contentStyle.color = isSqlMode ? sqlTextColor : fontColor;
+    }
     return EditorView.theme({
       '&': {
         fontSize: `${fontSize}px`,
         fontFamily: isEnderTheme ? 'JetBrains Mono, Consolas, monospace' : fontFamily,
         fontStyle: fontStyle,
       },
-      '.cm-content': {
-        fontSize: `${fontSize}px`,
-        fontFamily: isEnderTheme ? 'JetBrains Mono, Consolas, monospace' : fontFamily,
-        fontStyle: fontStyle,
-        color: isSqlMode ? sqlTextColor : fontColor,
-      },
-      '.cm-line': {
-        fontSize: `${fontSize}px`,
-        fontFamily: isEnderTheme ? 'JetBrains Mono, Consolas, monospace' : fontFamily,
-        fontStyle: fontStyle,
-        color: isSqlMode ? sqlTextColor : fontColor,
-      },
+      '.cm-content': contentStyle,
+      '.cm-line': contentStyle,
       '.cm-gutters': {
         fontSize: `${fontSize}px`,
         fontFamily: isEnderTheme ? 'JetBrains Mono, Consolas, monospace' : fontFamily,
@@ -1799,51 +1931,99 @@ function App() {
     }
   };
 
-  // Функции выполнения для окна 1
-  const executeCode1 = async () => {
+  // Функции выполнения для окна 1 (overrideCode — при автозапуске передаём актуальный код из таймера)
+  const executeCode1 = async (overrideCode) => {
     if (isRunning1) return;
-    
-    if (!code1.trim()) {
+    let codeFromState = overrideCode !== undefined && overrideCode !== null ? overrideCode : code1;
+    if (typeof codeFromState !== 'string' || codeFromState.includes('[object Object]')) {
+      const tabCode = tabs1.find(t => t.id === activeTab1)?.code;
+      codeFromState = (typeof tabCode === 'string' && !tabCode.includes('[object Object]')) ? tabCode : '';
+    }
+    const codeToRun = String(codeFromState ?? '').trim() ? String(codeFromState ?? '') : '';
+    if (!codeToRun.trim()) {
       setOutput1('Введите код для выполнения.');
       return;
     }
 
-    // В SQL-режиме проверяем выделение и выполняем только выделенный запрос
-    const hasSqlKeywords = /CREATE\s+TABLE|SELECT\s+.*\s+FROM|INSERT\s+INTO|UPDATE\s+.*\s+SET|DELETE\s+FROM/i.test(code1);
+    // В SQL-режиме проверяем выделение и выполняем только выделенный запрос (если не передан overrideCode)
+    const hasSqlKeywords = /CREATE\s+TABLE|SELECT\s+.*\s+FROM|INSERT\s+INTO|UPDATE\s+.*\s+SET|DELETE\s+FROM/i.test(codeToRun);
     
     if (sqlMode === true || hasSqlKeywords) {
       setIsRunning1(true);
       setOutput1('Выполнение SQL...\n');
       try {
-        let codeToParse = code1;
-        if (editorViewRef1.current) {
-          const selection = editorViewRef1.current.state.selection.main;
-          if (selection.from !== selection.to) {
-            codeToParse = editorViewRef1.current.state.doc.sliceString(selection.from, selection.to);
-            setOutput1('Выполняется выделенный фрагмент...\n');
+        // Текст для выполнения: из редактора (если есть и валидный) или из state code1
+        let codeToParse = codeToRun;
+        if (overrideCode == null && editorViewRef1.current) {
+          const view = editorViewRef1.current;
+          const state = view.state;
+          const doc = state.doc;
+          const sel = state.selection.main;
+          let fromEditor = '';
+          try {
+            if (sel.from !== sel.to) {
+              fromEditor = state.sliceDoc(sel.from, sel.to);
+              setOutput1('Выполняется выделенный фрагмент...\n');
+            } else {
+              fromEditor = state.sliceDoc(0, state.doc.length);
+            }
+            if (typeof fromEditor !== 'string' || fromEditor.includes('[object Object]')) {
+              const lines = typeof doc.lines === 'number' ? doc.lines : 0;
+              const parts = [];
+              for (let i = 1; i <= lines; i++) {
+                try {
+                  const line = doc.line(i);
+                  if (line && typeof line.text === 'string') parts.push(line.text);
+                } catch (_) {}
+              }
+              fromEditor = parts.join('\n');
+            }
+          } catch (e) {
+            console.warn('[executeCode1] чтение из редактора не удалось:', e);
           }
+          if (typeof fromEditor === 'string' && fromEditor.trim() && !fromEditor.includes('[object Object]')) {
+            codeToParse = fromEditor;
+          }
+        }
+        codeToParse = typeof codeToParse === 'string' ? codeToParse : String(codeToParse ?? '');
+        if (codeToParse.includes('[object Object]')) codeToParse = '';
+        if (!codeToParse.trim() && codeToRun.trim() && !codeToRun.includes('[object Object]')) codeToParse = codeToRun;
+        if (!codeToParse.trim() || codeToParse.includes('[object Object]')) {
+          const tabCode = tabs1.find(t => t.id === activeTab1)?.code;
+          if (typeof tabCode === 'string' && tabCode.trim() && !tabCode.includes('[object Object]')) codeToParse = tabCode;
         }
 
         if (sqlDialect === 'sql') {
           // SQL (SQLite в памяти): полное выполнение CREATE, INSERT, SELECT, JOIN и т.д.
           try {
-            const { output, error, tables } = await runSqlInMemory(codeToParse);
+            const { output, error, tables } = await runSqlInMemory(String(codeToParse ?? ''));
             const errMsg = error ? `Ошибка: ${error}\n\n${output}` : (output || 'Выполнено.');
             const hint = error && /no such table/i.test(error)
               ? '\n\nПодсказка: одна БД общая для всех вкладок. Сначала выполните скрипт с CREATE TABLE (во вкладке 1), затем SELECT можно делать в любой вкладке.'
               : '';
             setOutput1(errMsg + hint);
-            // Справа обновляем таблицы только если в запросе были CREATE/DROP TABLE — при простом SELECT панель не трогаем
+            // Справа обновляем таблицы при любом CREATE/DROP TABLE (в т.ч. после DROP — список может стать пустым)
             const hasCreateOrDrop = /CREATE\s+TABLE|DROP\s+TABLE/i.test(codeToParse);
-            if (hasCreateOrDrop && tables != null && tables.length > 0) {
+            if (hasCreateOrDrop && tables != null) {
               setSqlTables(tables);
               setErdPositions(prev => {
                 const next = { ...prev };
                 tables.forEach((t, idx) => {
                   if (!next[t.name]) next[t.name] = { x: 50 + (idx % 3) * 320, y: 50 + Math.floor(idx / 3) * 250 };
                 });
+                // Убираем позиции для таблиц, которых больше нет
+                Object.keys(next).forEach(name => {
+                  if (!tables.some(t => t.name === name)) delete next[name];
+                });
                 return next;
               });
+              if (sqlTableDataView && !tables.some(t => t.name === sqlTableDataView.tableName)) {
+                setSqlTableDataView(null);
+              }
+            }
+            // После INSERT/UPDATE/DELETE обновляем вид «Данные таблицы», если он открыт
+            if (!error && sqlTableDataView?.tableName) {
+              loadTableData(sqlTableDataView.tableName);
             }
           } catch (loadErr) {
             setOutput1('Для выполнения SQL установите sql.js: npm install sql.js\nПосле установки скопируйте public/sql-wasm.wasm (или перезапустите npm install).\nОшибка: ' + loadErr.message);
@@ -2527,6 +2707,17 @@ function App() {
     setErrorLines(errors);
   }, [output, parseErrors]);
 
+  useEffect(() => {
+    if (!showThemeDropdown) return;
+    const onMouseDown = (e) => {
+      if (themeDropdownRef.current && !themeDropdownRef.current.contains(e.target)) {
+        setShowThemeDropdown(false);
+      }
+    };
+    document.addEventListener('mousedown', onMouseDown);
+    return () => document.removeEventListener('mousedown', onMouseDown);
+  }, [showThemeDropdown]);
+
   // Автосохранение кода в localStorage (всегда включено)
   useEffect(() => {
     if (code) {
@@ -2539,9 +2730,24 @@ function App() {
     }
   }, [code, language]);
 
-  // Загрузка сохраненного кода при монтировании
+  // Загрузка сохранённых вкладок и кода при монтировании
   useEffect(() => {
     try {
+      const rawTabs = localStorage.getItem('codeforge_tabs');
+      const savedActiveTab = localStorage.getItem('codeforge_activeTab');
+      const parsed = rawTabs ? JSON.parse(rawTabs) : null;
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        const activeId = savedActiveTab && parsed.some(t => t.id === savedActiveTab) ? savedActiveTab : parsed[0].id;
+        const activeTabObj = parsed.find(t => t.id === activeId);
+        setTabs(parsed);
+        setActiveTab(activeId);
+        if (activeTabObj) {
+          setCode(activeTabObj.code ?? '');
+          setOutput(activeTabObj.output ?? '');
+          setLanguage(activeTabObj.language || 'javascript');
+        }
+        return;
+      }
       const savedLanguage = localStorage.getItem('codeforge_last_language') || language;
       const savedCode = localStorage.getItem(`codeforge_code_${savedLanguage}`);
       if (savedCode && !code) {
@@ -2551,11 +2757,70 @@ function App() {
         }
       }
     } catch (e) {
-      console.warn('Не удалось загрузить сохраненный код:', e);
+      console.warn('Не удалось загрузить сохраненный код/вкладки:', e);
     }
   }, []); // Только при монтировании
 
-  // Сохранение SQL вкладок и кода в localStorage (при перезапуске приложения)
+  // Загрузка сохранённых подключений Postgres/Oracle и диалекта SQL при монтировании
+  useEffect(() => {
+    try {
+      const rawPg = localStorage.getItem('codeforge_postgres_conn');
+      const rawOra = localStorage.getItem('codeforge_oracle_conn');
+      const savedDialect = localStorage.getItem('codeforge_sql_dialect');
+      if (rawPg) {
+        const parsed = JSON.parse(rawPg);
+        if (parsed && typeof parsed === 'object') {
+          setPostgresConn(prev => ({
+            host: parsed.host ?? prev.host,
+            port: typeof parsed.port === 'number' ? parsed.port : (parseInt(parsed.port, 10) || 5432),
+            user: parsed.user ?? prev.user,
+            password: parsed.password ?? prev.password,
+            database: parsed.database ?? prev.database
+          }));
+        }
+      }
+      if (rawOra) {
+        const parsed = JSON.parse(rawOra);
+        if (parsed && typeof parsed === 'object') {
+          setOracleConn(prev => ({
+            user: parsed.user ?? prev.user,
+            password: parsed.password ?? prev.password,
+            connectString: parsed.connectString ?? prev.connectString
+          }));
+        }
+      }
+      if (savedDialect === 'postgres' || savedDialect === 'oracle' || savedDialect === 'sql') {
+        setSqlDialect(savedDialect);
+      }
+    } catch (e) {
+      console.warn('Не удалось загрузить подключения SQL:', e);
+    }
+  }, []);
+
+  // Сохранение подключений Postgres/Oracle и диалекта SQL при изменении (чтобы восстанавливать после перезапуска)
+  useEffect(() => {
+    try {
+      localStorage.setItem('codeforge_postgres_conn', JSON.stringify(postgresConn));
+      localStorage.setItem('codeforge_oracle_conn', JSON.stringify(oracleConn));
+      localStorage.setItem('codeforge_sql_dialect', sqlDialect);
+    } catch (e) {
+      console.warn('Не удалось сохранить подключения SQL:', e);
+    }
+  }, [postgresConn, oracleConn, sqlDialect]);
+
+  // Сохранение вкладок (языки) в localStorage при изменениях и при закрытии
+  useEffect(() => {
+    if (sqlMode) return;
+    try {
+      const tabsToSave = tabs.map(t => t.id === activeTab ? { ...t, code, output, language } : t);
+      localStorage.setItem('codeforge_tabs', JSON.stringify(tabsToSave));
+      localStorage.setItem('codeforge_activeTab', activeTab);
+    } catch (e) {
+      console.warn('Не удалось сохранить вкладки:', e);
+    }
+  }, [tabs, activeTab, code, output, language, sqlMode]);
+
+  // Сохранение SQL вкладок, схемы и подключений в localStorage (при перезапуске приложения)
   const saveSqlToStorage = useCallback(() => {
     try {
       const t1 = tabs1.map(t => t.id === activeTab1 ? { ...t, code: code1 } : t);
@@ -2565,14 +2830,35 @@ function App() {
       localStorage.setItem('codeforge_sql_activeTab1', activeTab1);
       localStorage.setItem('codeforge_sql_activeTab2', activeTab2);
       localStorage.setItem('codeforge_sql_schema', JSON.stringify({ tables: sqlTables, erdPositions }));
+      localStorage.setItem('codeforge_postgres_conn', JSON.stringify(postgresConn));
+      localStorage.setItem('codeforge_oracle_conn', JSON.stringify(oracleConn));
+      localStorage.setItem('codeforge_sql_dialect', sqlDialect);
     } catch (e) {
       console.warn('Не удалось сохранить SQL:', e);
     }
-  }, [tabs1, tabs2, activeTab1, activeTab2, code1, code2, sqlTables, erdPositions]);
+  }, [tabs1, tabs2, activeTab1, activeTab2, code1, code2, sqlTables, erdPositions, postgresConn, oracleConn, sqlDialect]);
 
   useEffect(() => {
     if (sqlMode) saveSqlToStorage();
   }, [sqlMode, saveSqlToStorage]);
+
+  // В SQL-режиме при Postgres/Oracle без подключения — очищать список таблиц справа
+  useEffect(() => {
+    if (!sqlMode) return;
+    const pgNoConn = sqlDialect === 'postgres' && (!(postgresConn.user || '').trim() || !(postgresConn.database || '').trim());
+    const oraNoConn = sqlDialect === 'oracle' && (!(oracleConn.user || '').trim() || !(oracleConn.connectString || '').trim());
+    if (pgNoConn || oraNoConn) {
+      setSqlTables([]);
+      setSqlTableDataView(null);
+    }
+  }, [sqlMode, sqlDialect, postgresConn.user, postgresConn.database, oracleConn.user, oracleConn.connectString]);
+
+  // При диалекте «SQL» список таблиц справа берём из реальной in-memory БД, а не из localStorage
+  useEffect(() => {
+    if (sqlMode && sqlDialect === 'sql') {
+      syncSqlTablesFromDb();
+    }
+  }, [sqlMode, sqlDialect, syncSqlTablesFromDb]);
 
   useEffect(() => {
     const onBeforeUnload = () => {
@@ -2585,13 +2871,20 @@ function App() {
           localStorage.setItem('codeforge_sql_activeTab1', activeTab1);
           localStorage.setItem('codeforge_sql_activeTab2', activeTab2);
           localStorage.setItem('codeforge_sql_schema', JSON.stringify({ tables: sqlTables, erdPositions }));
+          localStorage.setItem('codeforge_postgres_conn', JSON.stringify(postgresConn));
+          localStorage.setItem('codeforge_oracle_conn', JSON.stringify(oracleConn));
+          localStorage.setItem('codeforge_sql_dialect', sqlDialect);
+        } else {
+          const tabsToSave = tabs.map(t => t.id === activeTab ? { ...t, code, output, language } : t);
+          localStorage.setItem('codeforge_tabs', JSON.stringify(tabsToSave));
+          localStorage.setItem('codeforge_activeTab', activeTab);
         }
         saveSqlDbToStorage();
       } catch (_) {}
     };
     window.addEventListener('beforeunload', onBeforeUnload);
     return () => window.removeEventListener('beforeunload', onBeforeUnload);
-  }, [sqlMode, tabs1, tabs2, activeTab1, activeTab2, code1, code2, sqlTables, erdPositions, saveSqlDbToStorage]);
+  }, [sqlMode, tabs, activeTab, code, output, language, tabs1, tabs2, activeTab1, activeTab2, code1, code2, sqlTables, erdPositions, postgresConn, oracleConn, sqlDialect, saveSqlDbToStorage]);
 
   const loadSqlFromStorage = useCallback(() => {
     try {
@@ -2613,34 +2906,59 @@ function App() {
     return null;
   }, []);
 
+  // Уникальное имя вкладки по максимальному номеру среди "Вкладка N"
+  const nextTabName = useCallback((prevTabs) => {
+    const used = prevTabs.map(t => {
+      const m = (t.name || '').match(/^Вкладка\s+(\d+)$/);
+      return m ? parseInt(m[1], 10) : 0;
+    });
+    const next = used.length ? Math.max(...used, 0) + 1 : 1;
+    return `Вкладка ${next}`;
+  }, []);
+
   // Функции для работы с вкладками (single view)
   const createNewTab = useCallback(() => {
-    const newTabId = `tab-${Date.now()}`;
-    const newTab = {
-      id: newTabId,
-      name: `Вкладка ${tabs.length + 1}`,
-      code: '',
-      output: '',
-      language: language
-    };
+    const now = Date.now();
+    if (now - createNewTabLockRef.current < CREATE_TAB_COOLDOWN_MS) return null;
+    createNewTabLockRef.current = now;
+    const newTabId = `tab-${now}`;
+    const codeToSave = code;
+    const outputToSave = output;
+    const langToSave = language;
     setTabs(prev => {
       const withCurrentSaved = prev.map(tab =>
-        tab.id === activeTab ? { ...tab, code, output, language } : tab
+        tab.id === activeTab ? { ...tab, code: codeToSave, output: outputToSave, language: langToSave } : tab
       );
+      const newTab = {
+        id: newTabId,
+        name: nextTabName(withCurrentSaved),
+        code: '',
+        output: '',
+        language: langToSave
+      };
       return [...withCurrentSaved, newTab];
     });
     setActiveTab(newTabId);
     setCode('');
     setOutput('');
     return newTabId;
-  }, [tabs.length, language, activeTab, code, output]);
+  }, [tabs, language, activeTab, code, output, nextTabName]);
 
   const closeTab = useCallback((tabId) => {
-    if (tabs.length === 1) return; // Нельзя закрыть последнюю вкладку
+    if (tabs.length === 1) return;
+    const closedIndex = tabs.findIndex(t => t.id === tabId);
+    if (closedIndex === -1) return; // вкладки нет — ничего не делаем
+    const remainingTabs = tabs.filter(tab => tab.id !== tabId);
+    if (remainingTabs.length === 0) return;
     setTabs(prev => prev.filter(tab => tab.id !== tabId));
     if (activeTab === tabId) {
-      const remainingTabs = tabs.filter(tab => tab.id !== tabId);
-      setActiveTab(remainingTabs[0]?.id || 'tab-1');
+      // Переключаемся на соседнюю: ту же позицию или левее (как в браузере)
+      const switchToIndex = Math.min(closedIndex, remainingTabs.length - 1);
+      const switchTo = remainingTabs[switchToIndex];
+      setActiveTab(switchTo.id);
+      setCode(switchTo.code);
+      setOutput(switchTo.output);
+      setLanguage(switchTo.language);
     }
   }, [tabs, activeTab]);
 
@@ -2656,38 +2974,46 @@ function App() {
 
   // Функции для работы с вкладками окна 1 (split view)
   const createNewTab1 = useCallback(() => {
-    const newTabId = `tab1-${Date.now()}`;
-    const newTab = {
-      id: newTabId,
-      name: `Вкладка ${tabs1.length + 1}`,
-      code: '',
-      output: '',
-      language: language1
-    };
+    const now = Date.now();
+    if (now - createNewTabLockRef.current < CREATE_TAB_COOLDOWN_MS) return null;
+    createNewTabLockRef.current = now;
+    const newTabId = `tab1-${now}`;
+    const codeToSave = code1;
+    const outputToSave = output1;
+    const langToSave = language1;
     setTabs1(prev => {
       const withCurrentSaved = prev.map(tab =>
-        tab.id === activeTab1 ? { ...tab, code: code1, output: output1, language: language1 } : tab
+        tab.id === activeTab1 ? { ...tab, code: codeToSave, output: outputToSave, language: langToSave } : tab
       );
+      const newTab = {
+        id: newTabId,
+        name: nextTabName(withCurrentSaved),
+        code: '',
+        output: '',
+        language: langToSave
+      };
       return [...withCurrentSaved, newTab];
     });
     setActiveTab1(newTabId);
     setCode1('');
     setOutput1('');
     return newTabId;
-  }, [tabs1.length, language1, activeTab1, code1, output1]);
+  }, [tabs1, language1, activeTab1, code1, output1, nextTabName]);
 
   const closeTab1 = useCallback((tabId) => {
-    if (tabs1.length === 1) return; // Нельзя закрыть последнюю вкладку
+    if (tabs1.length === 1) return;
+    const closedIndex = tabs1.findIndex(t => t.id === tabId);
+    if (closedIndex === -1) return;
+    const remainingTabs = tabs1.filter(tab => tab.id !== tabId);
+    if (remainingTabs.length === 0) return;
     setTabs1(prev => prev.filter(tab => tab.id !== tabId));
     if (activeTab1 === tabId) {
-      const remainingTabs = tabs1.filter(tab => tab.id !== tabId);
-      const newActiveTab = remainingTabs[0]?.id || 'tab1-1';
-      setActiveTab1(newActiveTab);
-      const tab = remainingTabs[0];
-      if (tab) {
-        setCode1(tab.code);
-        setOutput1(tab.output);
-      }
+      const switchToIndex = Math.min(closedIndex, remainingTabs.length - 1);
+      const switchTo = remainingTabs[switchToIndex];
+      setActiveTab1(switchTo.id);
+      setCode1(switchTo.code);
+      setOutput1(switchTo.output);
+      setLanguage1(switchTo.language);
     }
   }, [tabs1, activeTab1]);
 
@@ -2697,44 +3023,52 @@ function App() {
       setActiveTab1(tabId);
       setCode1(tab.code);
       setOutput1(tab.output);
-      setLanguage(tab.language);
+      setLanguage1(tab.language ?? 'javascript');
     }
   }, [tabs1]);
 
   // Функции для работы с вкладками окна 2 (split view)
   const createNewTab2 = useCallback(() => {
-    const newTabId = `tab2-${Date.now()}`;
-    const newTab = {
-      id: newTabId,
-      name: `Вкладка ${tabs2.length + 1}`,
-      code: '',
-      output: '',
-      language: language2
-    };
+    const now = Date.now();
+    if (now - createNewTabLockRef.current < CREATE_TAB_COOLDOWN_MS) return null;
+    createNewTabLockRef.current = now;
+    const newTabId = `tab2-${now}`;
+    const codeToSave = code2;
+    const outputToSave = output2;
+    const langToSave = language2;
     setTabs2(prev => {
       const withCurrentSaved = prev.map(tab =>
-        tab.id === activeTab2 ? { ...tab, code: code2, output: output2, language: language2 } : tab
+        tab.id === activeTab2 ? { ...tab, code: codeToSave, output: outputToSave, language: langToSave } : tab
       );
+      const newTab = {
+        id: newTabId,
+        name: nextTabName(withCurrentSaved),
+        code: '',
+        output: '',
+        language: langToSave
+      };
       return [...withCurrentSaved, newTab];
     });
     setActiveTab2(newTabId);
     setCode2('');
     setOutput2('');
     return newTabId;
-  }, [tabs2.length, language2, activeTab2, code2, output2]);
+  }, [tabs2, language2, activeTab2, code2, output2, nextTabName]);
 
   const closeTab2 = useCallback((tabId) => {
-    if (tabs2.length === 1) return; // Нельзя закрыть последнюю вкладку
+    if (tabs2.length === 1) return;
+    const closedIndex = tabs2.findIndex(t => t.id === tabId);
+    if (closedIndex === -1) return;
+    const remainingTabs = tabs2.filter(tab => tab.id !== tabId);
+    if (remainingTabs.length === 0) return;
     setTabs2(prev => prev.filter(tab => tab.id !== tabId));
     if (activeTab2 === tabId) {
-      const remainingTabs = tabs2.filter(tab => tab.id !== tabId);
-      const newActiveTab = remainingTabs[0]?.id || 'tab2-1';
-      setActiveTab2(newActiveTab);
-      const tab = remainingTabs[0];
-      if (tab) {
-        setCode2(tab.code);
-        setOutput2(tab.output);
-      }
+      const switchToIndex = Math.min(closedIndex, remainingTabs.length - 1);
+      const switchTo = remainingTabs[switchToIndex];
+      setActiveTab2(switchTo.id);
+      setCode2(switchTo.code);
+      setOutput2(switchTo.output);
+      setLanguage2(switchTo.language);
     }
   }, [tabs2, activeTab2]);
 
@@ -2748,36 +3082,48 @@ function App() {
     }
   }, [tabs2]);
 
-  // Сохраняем изменения в активную вкладку (single view)
+  // Сохраняем изменения в активную вкладку (single view), с задержкой чтобы не перезаписать только что переключённую вкладку
+  const prevActiveTabRef = useRef(activeTab);
   useEffect(() => {
     if (activeTab && !splitView) {
-      setTabs(prev => prev.map(tab => 
-        tab.id === activeTab 
-          ? { ...tab, code, output, language }
-          : tab
-      ));
+      if (prevActiveTabRef.current === activeTab) {
+        setTabs(prev => prev.map(tab => 
+          tab.id === activeTab 
+            ? { ...tab, code, output, language }
+            : tab
+        ));
+      }
+      prevActiveTabRef.current = activeTab;
     }
   }, [code, output, language, activeTab, splitView]);
 
   // Сохраняем изменения в активную вкладку окна 1 (split view)
+  const prevActiveTab1Ref = useRef(activeTab1);
   useEffect(() => {
     if (activeTab1 && splitView) {
-      setTabs1(prev => prev.map(tab => 
-        tab.id === activeTab1 
-          ? { ...tab, code: code1, output: output1, language: language1 }
-          : tab
-      ));
+      if (prevActiveTab1Ref.current === activeTab1) {
+        setTabs1(prev => prev.map(tab => 
+          tab.id === activeTab1 
+            ? { ...tab, code: code1, output: output1, language: language1 }
+            : tab
+        ));
+      }
+      prevActiveTab1Ref.current = activeTab1;
     }
   }, [code1, output1, language1, activeTab1, splitView]);
 
   // Сохраняем изменения в активную вкладку окна 2 (split view)
+  const prevActiveTab2Ref = useRef(activeTab2);
   useEffect(() => {
     if (activeTab2 && splitView) {
-      setTabs2(prev => prev.map(tab => 
-        tab.id === activeTab2 
-          ? { ...tab, code: code2, output: output2, language: language2 }
-          : tab
-      ));
+      if (prevActiveTab2Ref.current === activeTab2) {
+        setTabs2(prev => prev.map(tab => 
+          tab.id === activeTab2 
+            ? { ...tab, code: code2, output: output2, language: language2 }
+            : tab
+        ));
+      }
+      prevActiveTab2Ref.current = activeTab2;
     }
   }, [code2, output2, language2, activeTab2, splitView]);
 
@@ -3122,8 +3468,10 @@ function App() {
     <div className="app">
       <div className="toolbar">
         <div className="toolbar-left">
-          <h1 className="app-title">CodeForge Studio</h1>
-          <span className="app-creator">Создано: Aleksey Volkov</span>
+          <div className="app-brand">
+            <h1 className="app-title">CodeForge Studio</h1>
+            <span className="app-creator">Developer · Aleksey Volkov</span>
+          </div>
           {!splitView && (
             <select 
               className="language-select"
@@ -3198,17 +3546,74 @@ function App() {
                       ))}
                     </select>
                   </div>
-                  <div className="setting-group">
+                  <div className="setting-group" style={{ position: 'relative' }} ref={themeDropdownRef}>
                     <label>Тема редактора:</label>
-                    <select value={selectedTheme} onChange={(e) => {
-                      const v = e.target.value;
-                      setSelectedTheme(v);
-                      try { localStorage.setItem('codeforge_theme', v); } catch (err) {}
-                    }}>
-                      {availableThemes.map(theme => (
-                        <option key={theme.value} value={theme.value}>{theme.label}</option>
-                      ))}
-                    </select>
+                    <button
+                      type="button"
+                      onClick={() => setShowThemeDropdown(!showThemeDropdown)}
+                      style={{
+                        width: '100%',
+                        padding: '6px 10px',
+                        background: '#2d2d30',
+                        border: '1px solid #3e3e3e',
+                        borderRadius: '4px',
+                        color: '#d4d4d4',
+                        fontSize: '13px',
+                        textAlign: 'left',
+                        cursor: 'pointer',
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center'
+                      }}
+                      title="Выберите тему"
+                    >
+                      <span>{availableThemes.find(t => t.value === selectedTheme)?.label || selectedTheme}</span>
+                      <span style={{ opacity: 0.7 }}>{showThemeDropdown ? '▲' : '▼'}</span>
+                    </button>
+                    {showThemeDropdown && (
+                      <div
+                        style={{
+                          position: 'absolute',
+                          left: 0,
+                          right: 0,
+                          top: '100%',
+                          marginTop: '4px',
+                          maxHeight: '280px',
+                          overflowY: 'auto',
+                          background: '#252526',
+                          border: '1px solid #3e3e3e',
+                          borderRadius: '4px',
+                          zIndex: 1100,
+                          boxShadow: '0 4px 12px rgba(0,0,0,0.4)'
+                        }}
+                      >
+                        {availableThemes.map(theme => (
+                          <div
+                            key={theme.value}
+                            onClick={() => {
+                              setSelectedTheme(theme.value);
+                              setShowThemeDropdown(false);
+                              try { localStorage.setItem('codeforge_theme', theme.value); } catch (err) {}
+                            }}
+                            style={{
+                              padding: '8px 12px',
+                              cursor: 'pointer',
+                              color: selectedTheme === theme.value ? '#fff' : '#d4d4d4',
+                              background: selectedTheme === theme.value ? '#4C5866' : 'transparent',
+                              fontSize: '13px'
+                            }}
+                            onMouseEnter={(e) => {
+                              if (selectedTheme !== theme.value) e.currentTarget.style.background = '#2d2d30';
+                            }}
+                            onMouseLeave={(e) => {
+                              if (selectedTheme !== theme.value) e.currentTarget.style.background = 'transparent';
+                            }}
+                          >
+                            {theme.label}
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
                   <div className="setting-group" style={{ marginBottom: '8px' }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px' }}>
@@ -3308,7 +3713,11 @@ function App() {
                         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px' }}>
                           <label style={{ margin: 0 }}>Цвет переменных:</label>
                           <button
-                            onClick={() => setShowVariableColor(!showVariableColor)}
+                            onClick={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              setShowVariableColor(!showVariableColor);
+                            }}
                             style={{
                               background: 'transparent',
                               border: '1px solid #3e3e3e',
@@ -3374,6 +3783,22 @@ function App() {
                 <div className="settings-content">
                   {showColorSettings && (
                     <>
+                      <div className="setting-group" style={{ marginBottom: '10px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        <input
+                          type="checkbox"
+                          id="use-custom-syntax-over-theme"
+                          checked={useCustomSyntaxColors}
+                          onChange={(e) => {
+                            const v = e.target.checked;
+                            setUseCustomSyntaxColors(v);
+                            try { localStorage.setItem('codeforge_use_custom_syntax', v ? 'true' : 'false'); } catch (err) {}
+                          }}
+                          style={{ cursor: 'pointer' }}
+                        />
+                        <label htmlFor="use-custom-syntax-over-theme" style={{ margin: 0, cursor: 'pointer', fontSize: '13px' }}>
+                          Применять свои цвета синтаксиса поверх темы
+                        </label>
+                      </div>
                       {showFontColor && (
                         <div className="setting-group">
                           <div className="color-picker">
@@ -3382,7 +3807,7 @@ function App() {
                                 key={color}
                                 className={`color-option ${fontColor === color ? 'active' : ''}`}
                                 style={{ backgroundColor: color }}
-                                onClick={() => setFontColor(color)}
+                                onClick={(e) => { e.preventDefault(); e.stopPropagation(); setFontColor(color); }}
                                 title={color}
                               />
                             ))}
@@ -3397,7 +3822,7 @@ function App() {
                                 key={color}
                                 className={`color-option ${keywordColor === color ? 'active' : ''}`}
                                 style={{ backgroundColor: color }}
-                                onClick={() => setKeywordColor(color)}
+                                onClick={(e) => { e.preventDefault(); e.stopPropagation(); setKeywordColor(color); }}
                                 title={color}
                               />
                             ))}
@@ -3412,7 +3837,7 @@ function App() {
                                 key={color}
                                 className={`color-option ${classNameColor === color ? 'active' : ''}`}
                                 style={{ backgroundColor: color }}
-                                onClick={() => setClassNameColor(color)}
+                                onClick={(e) => { e.preventDefault(); e.stopPropagation(); setClassNameColor(color); }}
                                 title={color}
                               />
                             ))}
@@ -3427,7 +3852,7 @@ function App() {
                                 key={color}
                                 className={`color-option ${variableColor === color ? 'active' : ''}`}
                                 style={{ backgroundColor: color }}
-                                onClick={() => setVariableColor(color)}
+                                onClick={(e) => { e.preventDefault(); e.stopPropagation(); setVariableColor(color); }}
                                 title={color}
                               />
                             ))}
@@ -3442,7 +3867,9 @@ function App() {
                                 key={color}
                                 className={`color-option ${backgroundColor === color ? 'active' : ''}`}
                                 style={{ backgroundColor: color }}
-                                onClick={() => {
+                                onClick={(e) => {
+                                  e.preventDefault();
+                                  e.stopPropagation();
                                   setBackgroundColor(color);
                                   try {
                                     localStorage.setItem('codeforge_bg_color', color);
@@ -3651,10 +4078,13 @@ function App() {
                               {tabs1.length > 1 && (
                                 <span
                                   onClick={(e) => {
+                                    e.preventDefault();
                                     e.stopPropagation();
                                     closeTab1(tab.id);
                                   }}
+                                  onMouseDown={(e) => e.stopPropagation()}
                                   style={{ marginLeft: '4px', cursor: 'pointer' }}
+                                  title="Закрыть вкладку"
                                 >
                                   ×
                                 </span>
@@ -3714,6 +4144,7 @@ function App() {
                   }}
                 >
                   <CodeMirror
+                    key={`${selectedTheme}-1`}
                     value={code1}
                     theme={[getCurrentTheme(), customTheme]}
                     editable={true}
@@ -3807,9 +4238,34 @@ function App() {
                         }
                       ])
                     ]}
-                    onChange={(value) => {
-                      setCode1(value);
-                      if (sqlMode) codeByDialectRef.current[sqlDialect] = value;
+                    onChange={(value, viewUpdate) => {
+                      let str = '';
+                      if (typeof value === 'string') {
+                        str = value;
+                      } else if (value && typeof value === 'object' && value.state && typeof value.state.sliceDoc === 'function') {
+                        try {
+                          const state = value.state;
+                          str = state.sliceDoc(0, state.doc.length);
+                        } catch (_) {}
+                      }
+                      if (!str && viewUpdate && viewUpdate.state) {
+                        try {
+                          const state = viewUpdate.state;
+                          str = state.sliceDoc(0, state.doc.length);
+                        } catch (_) {}
+                      }
+                      if (typeof str !== 'string' || str.includes('[object Object]')) return;
+                      setCode1(str);
+                      if (sqlMode) codeByDialectRef.current[sqlDialect] = str;
+                      if (autoDetectTimerRef.current) clearTimeout(autoDetectTimerRef.current);
+                      if (!sqlMode && Date.now() < skipAutoDetectUntilRef.current) return;
+                      autoDetectTimerRef.current = setTimeout(() => {
+                        if (!sqlMode) {
+                          const detected = detectLanguageFromCode(str);
+                          if (detected && detected !== language1) setLanguage1(detected);
+                        }
+                        // SQL-диалект не переключаем по коду — только вручную (выбор в списке)
+                      }, AUTO_DETECT_DEBOUNCE_MS);
                     }}
                     onCreateEditor={(view) => {
                       editorViewRef1.current = view;
@@ -3969,7 +4425,7 @@ function App() {
                     {sqlTableDataView && (
                       <div style={{ marginBottom: '12px', border: '1px solid #3e3e3e', borderRadius: '4px', background: '#252526', overflow: 'hidden' }}>
                         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 10px', background: '#2d2d30', borderBottom: '1px solid #3e3e3e' }}>
-                          <span style={{ fontWeight: 'bold', color: '#f6e6a9', fontSize: '12px' }}>Данные таблицы: {sqlTableDataView.tableName}</span>
+                          <span style={{ fontWeight: 'bold', color: '#d4d4d4', fontSize: '12px' }}>Данные таблицы: {sqlTableDataView.tableName}</span>
                           <button className="btn btn-secondary" onClick={() => setSqlTableDataView(null)} style={{ padding: '2px 8px', fontSize: '11px' }}>Закрыть</button>
                         </div>
                         <div style={{ overflow: 'auto', maxHeight: '280px' }}>
@@ -3977,12 +4433,14 @@ function App() {
                             <thead>
                               <tr style={{ borderBottom: '1px solid #3e3e3e', background: '#2a2a2a' }}>
                                 {(sqlTableDataView.columns || []).map((c, i) => (
-                                  <th key={i} style={{ textAlign: 'left', padding: '6px 8px', color: '#f6e6a9', fontWeight: 'bold' }}>{c}</th>
+                                  <th key={i} style={{ textAlign: 'left', padding: '6px 8px', color: '#d4d4d4', fontWeight: 'bold' }}>{c}</th>
                                 ))}
                               </tr>
                             </thead>
                             <tbody>
-                              {(sqlTableDataView.rows || []).length === 0 ? (
+                              {sqlTableDataView.loading ? (
+                                <tr><td colSpan={Math.max(1, (sqlTableDataView.columns || []).length)} style={{ padding: '12px', color: '#858585' }}>Загрузка...</td></tr>
+                              ) : (sqlTableDataView.rows || []).length === 0 ? (
                                 <tr><td colSpan={(sqlTableDataView.columns || []).length} style={{ padding: '12px', color: '#858585' }}>(0 строк)</td></tr>
                               ) : (sqlTableDataView.rows || []).map((row, ri) => (
                                 <tr key={ri} style={{ borderBottom: '1px solid #2a2a2a' }}>
@@ -3999,8 +4457,11 @@ function App() {
                     )}
                     {sqlTables.length === 0 ? (
                       <div style={{ color: '#858585', fontSize: '12px' }}>
-                        Не найдены операторы <code>CREATE TABLE</code>.<br />
-                        Напишите их слева и нажмите «📊 Обновить».
+                        {sqlDialect === 'postgres' && (!(postgresConn.user || '').trim() || !(postgresConn.database || '').trim())
+                          ? 'Подключение PostgreSQL не настроено. Укажите пользователя и базу данных в настройках (кнопка «Подключение PostgreSQL» выше).'
+                          : sqlDialect === 'oracle' && (!(oracleConn.user || '').trim() || !(oracleConn.connectString || '').trim())
+                            ? 'Подключение Oracle не настроено. Укажите пользователя и connectString в настройках (кнопка «Подключение Oracle» выше).'
+                            : 'Для актуальности нажмите «📊 Обновить».'}
                       </div>
                     ) : sqlTableDataView ? (
                       // Когда показываются данные таблицы - не показываем ни схемы, ни ER диаграмму
@@ -4030,7 +4491,7 @@ function App() {
                             <span 
                               style={{ 
                                 fontWeight: 'bold', 
-                                color: '#f6e6a9', 
+                                color: '#d4d4d4', 
                                 fontSize: '13px',
                                 cursor: 'pointer',
                                 textDecoration: 'underline'
@@ -4065,10 +4526,10 @@ function App() {
                                   <td style={{ padding: '4px 8px', color: '#d4d4d4', fontFamily: 'monospace' }}>
                                     {col.name}
                                   </td>
-                                  <td style={{ padding: '4px 8px', color: '#f6e6a9', fontFamily: 'monospace' }}>
+                                  <td style={{ padding: '4px 8px', color: '#d4d4d4', fontFamily: 'monospace' }}>
                                     {col.type}
                                   </td>
-                                  <td style={{ textAlign: 'center', padding: '4px 8px', color: col.isPrimaryKey ? '#f6e6a9' : '#555' }}>
+                                  <td style={{ textAlign: 'center', padding: '4px 8px', color: col.isPrimaryKey ? '#5E6D7B' : '#555' }}>
                                     {col.isPrimaryKey ? '✓' : ''}
                                   </td>
                                   <td style={{ textAlign: 'center', padding: '4px 8px', color: col.isNotNull ? '#ff7b72' : '#555' }}>
@@ -4146,7 +4607,7 @@ function App() {
                         >
                           <defs>
                             <marker id="erd-arrowhead" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
-                              <polygon points="0 0, 10 3, 0 6" fill="#f6e6a9" />
+                              <polygon points="0 0, 10 3, 0 6" fill="#5E6D7B" />
                             </marker>
                           </defs>
                           {relations.map((rel, idx) => {
@@ -4205,7 +4666,7 @@ function App() {
                                 y1={ptFrom.y}
                                 x2={ptTo.x}
                                 y2={ptTo.y}
-                                stroke="#f6e6a9"
+                                stroke="#5E6D7B"
                                 strokeWidth="2"
                                 markerEnd="url(#erd-arrowhead)"
                               />
@@ -4219,7 +4680,7 @@ function App() {
                             <div
                               key={table.name}
                               style={{
-                                border: '2px solid #f6e6a9',
+                                border: '2px solid #3e3e3e',
                                 borderRadius: '6px',
                                 padding: '12px',
                                 background: '#252526',
@@ -4246,7 +4707,7 @@ function App() {
                               <div
                               style={{
                                 fontWeight: 'bold',
-                                color: '#f6e6a9',
+                                color: '#d4d4d4',
                                 fontSize: '14px',
                                 marginBottom: '8px',
                                 paddingBottom: '4px',
@@ -4272,13 +4733,13 @@ function App() {
                                     gap: '8px'
                                   }}
                                 >
-                                  <span style={{ color: col.isPrimaryKey ? '#f6e6a9' : col.isNotNull ? '#ff7b72' : '#d4d4d4' }}>
+                                  <span style={{ color: col.isPrimaryKey ? '#5E6D7B' : col.isNotNull ? '#ff7b72' : '#d4d4d4' }}>
                                     {col.isPrimaryKey ? '🔑' : col.isNotNull ? '⚠' : '○'}
                                   </span>
                                   <span style={{ fontWeight: col.isPrimaryKey ? 'bold' : 'normal' }}>
                                     {col.name}
                                   </span>
-                                  <span style={{ color: '#f6e6a9' }}>: {col.type}</span>
+                                  <span style={{ color: '#d4d4d4' }}>: {col.type}</span>
                                   {col.isUnique && <span style={{ color: '#d2a8ff', fontSize: '10px' }}>[UNIQUE]</span>}
                                 </div>
                               ))}
@@ -4361,10 +4822,13 @@ function App() {
                                   {tabs2.length > 1 && (
                                     <span
                                       onClick={(e) => {
+                                        e.preventDefault();
                                         e.stopPropagation();
                                         closeTab2(tab.id);
                                       }}
+                                      onMouseDown={(e) => e.stopPropagation()}
                                       style={{ marginLeft: '4px', cursor: 'pointer' }}
+                                      title="Закрыть вкладку"
                                     >
                                       ×
                                     </span>
@@ -4406,6 +4870,7 @@ function App() {
                       }}
                     >
                       <CodeMirror
+                        key={`${selectedTheme}-2`}
                         ref={editorRef2}
                         value={code2}
                         theme={[getCurrentTheme(), customTheme]}
@@ -4500,7 +4965,23 @@ function App() {
                             }
                           ])
                         ]}
-                        onChange={(value) => setCode2(value)}
+                        onChange={(value, viewUpdate) => {
+                          let str = typeof value === 'string' ? value : '';
+                          if (!str && value && typeof value === 'object' && value.state?.sliceDoc) {
+                            try { str = value.state.sliceDoc(0, value.state.doc.length); } catch (_) {}
+                          }
+                          if (!str && viewUpdate?.state) {
+                            try { str = viewUpdate.state.sliceDoc(0, viewUpdate.state.doc.length); } catch (_) {}
+                          }
+                          if (typeof str !== 'string') return;
+                          setCode2(str);
+                          if (autoDetectTimerRef.current) clearTimeout(autoDetectTimerRef.current);
+                          if (Date.now() < skipAutoDetectUntilRef.current) return;
+                          autoDetectTimerRef.current = setTimeout(() => {
+                            const detected = detectLanguageFromCode(str);
+                            if (detected && detected !== language2) setLanguage2(detected);
+                          }, AUTO_DETECT_DEBOUNCE_MS);
+                        }}
                         onCreateEditor={(view) => {
                           editorViewRef2.current = view;
                         }}
@@ -4621,11 +5102,16 @@ function App() {
                             {tab.name}
                             {tabs.length > 1 && (
                               <span
+                                role="button"
+                                tabIndex={0}
                                 onClick={(e) => {
+                                  e.preventDefault();
                                   e.stopPropagation();
                                   closeTab(tab.id);
                                 }}
+                                onMouseDown={(e) => e.stopPropagation()}
                                 style={{ marginLeft: '4px', cursor: 'pointer' }}
+                                title="Закрыть вкладку"
                               >
                                 ×
                               </span>
@@ -4649,6 +5135,7 @@ function App() {
                 }}
               >
                 <CodeMirror
+                  key={selectedTheme}
                   value={code}
                   theme={[getCurrentTheme(), customTheme]}
                   editable={true}
@@ -4743,7 +5230,23 @@ function App() {
                       }
                     ])
                   ]}
-                  onChange={(value) => setCode(value)}
+                  onChange={(value, viewUpdate) => {
+                    let str = typeof value === 'string' ? value : '';
+                    if (!str && value && typeof value === 'object' && value.state?.sliceDoc) {
+                      try { str = value.state.sliceDoc(0, value.state.doc.length); } catch (_) {}
+                    }
+                    if (!str && viewUpdate?.state) {
+                      try { str = viewUpdate.state.sliceDoc(0, viewUpdate.state.doc.length); } catch (_) {}
+                    }
+                    if (typeof str !== 'string') return;
+                    setCode(str);
+                    if (autoDetectTimerRef.current) clearTimeout(autoDetectTimerRef.current);
+                    if (Date.now() < skipAutoDetectUntilRef.current) return;
+                    autoDetectTimerRef.current = setTimeout(() => {
+                      const detected = detectLanguageFromCode(str);
+                      if (detected && detected !== language) setLanguage(detected);
+                    }, AUTO_DETECT_DEBOUNCE_MS);
+                  }}
                   onCreateEditor={(view) => {
                     editorViewRef.current = view;
                   }}
@@ -4909,6 +5412,8 @@ function App() {
                   setCode2(tabs2Selected[0].code);
                   setOutput1(tabs1Selected[0].output);
                   setOutput2(tabs2Selected[0].output);
+                  setLanguage1(tabs1Selected[0].language ?? 'javascript');
+                  setLanguage2(tabs2Selected[0].language ?? 'javascript');
                   setSplitView(true);
                   setShowTabSplitModal(false);
                 }}
