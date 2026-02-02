@@ -3123,6 +3123,7 @@ function App() {
       <div className="toolbar">
         <div className="toolbar-left">
           <h1 className="app-title">CodeForge Studio</h1>
+          <span className="app-creator">Создано: Aleksey Volkov</span>
           {!splitView && (
             <select 
               className="language-select"
