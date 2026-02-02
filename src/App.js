@@ -224,6 +224,15 @@ function App() {
     return sqlJsInitPromiseRef.current;
   }, []);
 
+  const resetSqlDb = useCallback(() => {
+    try {
+      sqlJsDbRef.current = null;
+      localStorage.removeItem('codeforge_sqlite_db');
+      setSqlTables([]);
+      setSqlTableDataView(null);
+    } catch (_) {}
+  }, []);
+
   const saveSqlDbToStorage = useCallback(() => {
     try {
       const db = sqlJsDbRef.current;
@@ -579,9 +588,11 @@ function App() {
         const activeId2 = dataToUse.activeTab2 || dataToUse.tabs2[0]?.id;
         const activeTab1Obj = dataToUse.tabs1.find(t => t.id === activeId1);
         const activeTab2Obj = dataToUse.tabs2.find(t => t.id === activeId2);
-        setCode1((activeTab1Obj?.code ?? lastSqlCode) || currentCode || '');
-        setCode2(activeTab2Obj?.code ?? '');
-        codeByDialectRef.current.sql = (activeTab1Obj?.code ?? lastSqlCode) || currentCode || '';
+        const code1Restore = activeTab1Obj?.code !== undefined ? activeTab1Obj.code : (lastSqlCode || currentCode || '');
+        const code2Restore = activeTab2Obj?.code !== undefined ? activeTab2Obj.code : '';
+        setCode1(code1Restore);
+        setCode2(code2Restore);
+        codeByDialectRef.current.sql = code1Restore;
       } else {
         const baseCode = lastSqlCode || currentCode || '';
         setCode1(baseCode);
@@ -1240,12 +1251,16 @@ function App() {
     const themeColors = getThemeSyntaxColors(selectedTheme);
     const useThemeColors = selectedTheme !== 'enderTheme' && selectedTheme !== 'oneDark';
     
-    // Для SQL-режима используем мягкие цвета, очень близкие к белому
+    // Для SQL-режима используем мягкие тёплые жёлтоватые оттенки
     const isSqlMode = sqlMode === true;
-    const sqlKeywordColor = '#f0ebe0'; // почти белый с легким бежевым оттенком для ключевых слов SQL
-    const sqlFunctionColor = '#ebe6dd'; // почти белый светло-бежевый для функций
-    const sqlVariableColor = '#e8e8e8'; // очень светло-серый для переменных
-    const sqlStringColor = '#dce8d0'; // очень светлый зеленоватый для строк
+    // Очень мягкий, светлый жёлтый для ключевых слов и общего акцента
+    const sqlKeywordColor = '#f6e6a9';
+    // Чуть более тёплый жёлтый для имён функций / типов
+    const sqlFunctionColor = '#f3dea0';
+    // Мягкий светло-жёлтый для переменных / идентификаторов
+    const sqlVariableColor = '#f2e3b5';
+    // Светлый жёлто-кремовый для строк
+    const sqlStringColor = '#f7f0c5';
     
     const finalKeywordColor = isSqlMode ? sqlKeywordColor : (useThemeColors ? themeColors.keyword : keywordColor);
     const finalClassNameColor = isSqlMode ? sqlFunctionColor : (useThemeColors ? themeColors.className : classNameColor);
@@ -1280,8 +1295,8 @@ function App() {
     if (tags.bracket) styleRules.push({ tag: tags.bracket, color: bracketColor });
     if (tags.punctuation) styleRules.push({ tag: tags.punctuation, color: bracketColor });
     
-    // Строки - светло-синий (или мягко-зеленый для SQL)
-    const stringColor = isSqlMode ? '#98c379' : '#a5d6ff';
+    // Строки - мягкий желтоватый для SQL, светло-синий для остальных языков
+    const stringColor = isSqlMode ? sqlStringColor : '#a5d6ff';
     if (tags.string) styleRules.push({ tag: tags.string, color: stringColor });
     if (tags.string2) styleRules.push({ tag: tags.string2, color: stringColor });
     
@@ -1530,6 +1545,8 @@ function App() {
   // Создаем кастомную тему с настройками шрифта (Ender Theme стиль)
   const customTheme = useMemo(() => {
     const isEnderTheme = selectedTheme === 'enderTheme';
+    const isSqlMode = sqlMode === true;
+    const sqlTextColor = '#f6e6a9'; // мягкий светло-жёлтый для текста SQL
     return EditorView.theme({
       '&': {
         fontSize: `${fontSize}px`,
@@ -1540,18 +1557,20 @@ function App() {
         fontSize: `${fontSize}px`,
         fontFamily: isEnderTheme ? 'JetBrains Mono, Consolas, monospace' : fontFamily,
         fontStyle: fontStyle,
+        color: isSqlMode ? sqlTextColor : fontColor,
       },
       '.cm-line': {
         fontSize: `${fontSize}px`,
         fontFamily: isEnderTheme ? 'JetBrains Mono, Consolas, monospace' : fontFamily,
         fontStyle: fontStyle,
+        color: isSqlMode ? sqlTextColor : fontColor,
       },
       '.cm-gutters': {
         fontSize: `${fontSize}px`,
         fontFamily: isEnderTheme ? 'JetBrains Mono, Consolas, monospace' : fontFamily,
       },
     }, { dark: true });
-  }, [fontFamily, fontSize, fontStyle, selectedTheme]);
+  }, [fontFamily, fontSize, fontStyle, selectedTheme, sqlMode, fontColor]);
 
   // Получаем язык для CodeMirror
   const getLanguageExtension = (lang = language) => {
@@ -1705,7 +1724,7 @@ function App() {
 
   const executeJava = async () => {
     if (!ipcRenderer) {
-      setOutput('Java выполнение требует Electron IPC.');
+      setOutput('Выполнение Java доступно только в десктопной версии (Electron).\n\nЗапустите приложение через npm run electron-dev или собранный exe — в браузере Java не выполняется.');
       return;
     }
     try {
@@ -2557,8 +2576,8 @@ function App() {
 
   useEffect(() => {
     const onBeforeUnload = () => {
-      if (sqlMode) {
-        try {
+      try {
+        if (sqlMode) {
           const t1 = tabs1.map(t => t.id === activeTab1 ? { ...t, code: code1 } : t);
           const t2 = tabs2.map(t => t.id === activeTab2 ? { ...t, code: code2 } : t);
           localStorage.setItem('codeforge_sql_tabs1', JSON.stringify(t1));
@@ -2566,12 +2585,13 @@ function App() {
           localStorage.setItem('codeforge_sql_activeTab1', activeTab1);
           localStorage.setItem('codeforge_sql_activeTab2', activeTab2);
           localStorage.setItem('codeforge_sql_schema', JSON.stringify({ tables: sqlTables, erdPositions }));
-        } catch (_) {}
-      }
+        }
+        saveSqlDbToStorage();
+      } catch (_) {}
     };
     window.addEventListener('beforeunload', onBeforeUnload);
     return () => window.removeEventListener('beforeunload', onBeforeUnload);
-  }, [sqlMode, tabs1, tabs2, activeTab1, activeTab2, code1, code2, sqlTables, erdPositions]);
+  }, [sqlMode, tabs1, tabs2, activeTab1, activeTab2, code1, code2, sqlTables, erdPositions, saveSqlDbToStorage]);
 
   const loadSqlFromStorage = useCallback(() => {
     try {
@@ -2603,12 +2623,17 @@ function App() {
       output: '',
       language: language
     };
-    setTabs(prev => [...prev, newTab]);
+    setTabs(prev => {
+      const withCurrentSaved = prev.map(tab =>
+        tab.id === activeTab ? { ...tab, code, output, language } : tab
+      );
+      return [...withCurrentSaved, newTab];
+    });
     setActiveTab(newTabId);
     setCode('');
     setOutput('');
     return newTabId;
-  }, [tabs.length, language]);
+  }, [tabs.length, language, activeTab, code, output]);
 
   const closeTab = useCallback((tabId) => {
     if (tabs.length === 1) return; // Нельзя закрыть последнюю вкладку
@@ -2639,12 +2664,17 @@ function App() {
       output: '',
       language: language1
     };
-    setTabs1(prev => [...prev, newTab]);
+    setTabs1(prev => {
+      const withCurrentSaved = prev.map(tab =>
+        tab.id === activeTab1 ? { ...tab, code: code1, output: output1, language: language1 } : tab
+      );
+      return [...withCurrentSaved, newTab];
+    });
     setActiveTab1(newTabId);
     setCode1('');
     setOutput1('');
     return newTabId;
-  }, [tabs1.length, language1]);
+  }, [tabs1.length, language1, activeTab1, code1, output1]);
 
   const closeTab1 = useCallback((tabId) => {
     if (tabs1.length === 1) return; // Нельзя закрыть последнюю вкладку
@@ -2681,12 +2711,17 @@ function App() {
       output: '',
       language: language2
     };
-    setTabs2(prev => [...prev, newTab]);
+    setTabs2(prev => {
+      const withCurrentSaved = prev.map(tab =>
+        tab.id === activeTab2 ? { ...tab, code: code2, output: output2, language: language2 } : tab
+      );
+      return [...withCurrentSaved, newTab];
+    });
     setActiveTab2(newTabId);
     setCode2('');
     setOutput2('');
     return newTabId;
-  }, [tabs2.length, language2]);
+  }, [tabs2.length, language2, activeTab2, code2, output2]);
 
   const closeTab2 = useCallback((tabId) => {
     if (tabs2.length === 1) return; // Нельзя закрыть последнюю вкладку
@@ -3804,7 +3839,7 @@ function App() {
                 <div className="output-header">
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%' }}>
                     <span className="output-title">
-                      {sqlMode ? 'Результат выполнения SQL (результат SELECT — здесь)' : 'Результат выполнения (1)'}
+                      {sqlMode ? 'Результат выполнения' : 'Результат выполнения (1)'}
                     </span>
                     <button 
                       className="btn btn-secondary"
@@ -3826,7 +3861,7 @@ function App() {
                       color: output1 ? fontColor : '#6a6a6a'
                     }}
                   >
-                    {output1 || (sqlMode ? 'Результат SELECT появится здесь после нажатия «Выполнить» (Ctrl+Enter / F8)' : 'Вывод появится здесь после выполнения кода...')}
+                    {output1 || (sqlMode ? 'Результат появится здесь после нажатия «Выполнить» (Ctrl+Enter / F8)' : 'Вывод появится здесь после выполнения кода...')}
                   </pre>
                 </div>
               </div>
@@ -3857,9 +3892,25 @@ function App() {
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%' }}>
                       <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
                         <span className="editor-title">
-                          Схемы SQL ({sqlDialect === 'sql' ? 'SQL' : sqlDialect === 'postgres' ? 'PostgreSQL' : 'Oracle'})
+                          Схемы  ({sqlDialect === 'sql' ? 'SQL' : sqlDialect === 'postgres' ? 'PostgreSQL' : 'Oracle'})
                         </span>
                         <div style={{ display: 'flex', gap: '4px', marginLeft: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
+                          <button
+                            className="btn btn-secondary"
+                            onClick={() => sqlDialect === 'sql' && executeCode1()}
+                            style={{ padding: '2px 8px', fontSize: '11px' }}
+                            title="Выполнить скрипт слева (создать таблицы и заполнить данные)"
+                          >
+                            📊 Обновить
+                          </button>
+                          <button
+                            className="btn btn-secondary"
+                            onClick={() => { if (window.confirm('Сбросить БД? Все таблицы и данные будут удалены.')) resetSqlDb(); }}
+                            style={{ padding: '2px 8px', fontSize: '11px' }}
+                            title="Удалить все таблицы и начать заново"
+                          >
+                            🗑️ Сбросить БД
+                          </button>
                           <button
                             className={`btn btn-secondary ${sqlViewMode === 'tables' && !sqlTableDataView ? 'active' : ''}`}
                             onClick={() => { setSqlViewMode('tables'); setSqlTableDataView(null); }}
@@ -3917,7 +3968,7 @@ function App() {
                     {sqlTableDataView && (
                       <div style={{ marginBottom: '12px', border: '1px solid #3e3e3e', borderRadius: '4px', background: '#252526', overflow: 'hidden' }}>
                         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 10px', background: '#2d2d30', borderBottom: '1px solid #3e3e3e' }}>
-                          <span style={{ fontWeight: 'bold', color: '#4fc3f7', fontSize: '12px' }}>Данные таблицы: {sqlTableDataView.tableName}</span>
+                          <span style={{ fontWeight: 'bold', color: '#f6e6a9', fontSize: '12px' }}>Данные таблицы: {sqlTableDataView.tableName}</span>
                           <button className="btn btn-secondary" onClick={() => setSqlTableDataView(null)} style={{ padding: '2px 8px', fontSize: '11px' }}>Закрыть</button>
                         </div>
                         <div style={{ overflow: 'auto', maxHeight: '280px' }}>
@@ -3925,7 +3976,7 @@ function App() {
                             <thead>
                               <tr style={{ borderBottom: '1px solid #3e3e3e', background: '#2a2a2a' }}>
                                 {(sqlTableDataView.columns || []).map((c, i) => (
-                                  <th key={i} style={{ textAlign: 'left', padding: '6px 8px', color: '#4fc3f7', fontWeight: 'bold' }}>{c}</th>
+                                  <th key={i} style={{ textAlign: 'left', padding: '6px 8px', color: '#f6e6a9', fontWeight: 'bold' }}>{c}</th>
                                 ))}
                               </tr>
                             </thead>
@@ -3978,7 +4029,7 @@ function App() {
                             <span 
                               style={{ 
                                 fontWeight: 'bold', 
-                                color: '#4fc3f7', 
+                                color: '#f6e6a9', 
                                 fontSize: '13px',
                                 cursor: 'pointer',
                                 textDecoration: 'underline'
@@ -4013,10 +4064,10 @@ function App() {
                                   <td style={{ padding: '4px 8px', color: '#d4d4d4', fontFamily: 'monospace' }}>
                                     {col.name}
                                   </td>
-                                  <td style={{ padding: '4px 8px', color: '#79c0ff', fontFamily: 'monospace' }}>
+                                  <td style={{ padding: '4px 8px', color: '#f6e6a9', fontFamily: 'monospace' }}>
                                     {col.type}
                                   </td>
-                                  <td style={{ textAlign: 'center', padding: '4px 8px', color: col.isPrimaryKey ? '#4fc3f7' : '#555' }}>
+                                  <td style={{ textAlign: 'center', padding: '4px 8px', color: col.isPrimaryKey ? '#f6e6a9' : '#555' }}>
                                     {col.isPrimaryKey ? '✓' : ''}
                                   </td>
                                   <td style={{ textAlign: 'center', padding: '4px 8px', color: col.isNotNull ? '#ff7b72' : '#555' }}>
@@ -4094,7 +4145,7 @@ function App() {
                         >
                           <defs>
                             <marker id="erd-arrowhead" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
-                              <polygon points="0 0, 10 3, 0 6" fill="#4fc3f7" />
+                              <polygon points="0 0, 10 3, 0 6" fill="#f6e6a9" />
                             </marker>
                           </defs>
                           {relations.map((rel, idx) => {
@@ -4153,7 +4204,7 @@ function App() {
                                 y1={ptFrom.y}
                                 x2={ptTo.x}
                                 y2={ptTo.y}
-                                stroke="#4fc3f7"
+                                stroke="#f6e6a9"
                                 strokeWidth="2"
                                 markerEnd="url(#erd-arrowhead)"
                               />
@@ -4167,7 +4218,7 @@ function App() {
                             <div
                               key={table.name}
                               style={{
-                                border: '2px solid #4fc3f7',
+                                border: '2px solid #f6e6a9',
                                 borderRadius: '6px',
                                 padding: '12px',
                                 background: '#252526',
@@ -4194,7 +4245,7 @@ function App() {
                               <div
                               style={{
                                 fontWeight: 'bold',
-                                color: '#4fc3f7',
+                                color: '#f6e6a9',
                                 fontSize: '14px',
                                 marginBottom: '8px',
                                 paddingBottom: '4px',
@@ -4220,13 +4271,13 @@ function App() {
                                     gap: '8px'
                                   }}
                                 >
-                                  <span style={{ color: col.isPrimaryKey ? '#4fc3f7' : col.isNotNull ? '#ff7b72' : '#d4d4d4' }}>
+                                  <span style={{ color: col.isPrimaryKey ? '#f6e6a9' : col.isNotNull ? '#ff7b72' : '#d4d4d4' }}>
                                     {col.isPrimaryKey ? '🔑' : col.isNotNull ? '⚠' : '○'}
                                   </span>
                                   <span style={{ fontWeight: col.isPrimaryKey ? 'bold' : 'normal' }}>
                                     {col.name}
                                   </span>
-                                  <span style={{ color: '#79c0ff' }}>: {col.type}</span>
+                                  <span style={{ color: '#f6e6a9' }}>: {col.type}</span>
                                   {col.isUnique && <span style={{ color: '#d2a8ff', fontSize: '10px' }}>[UNIQUE]</span>}
                                 </div>
                               ))}

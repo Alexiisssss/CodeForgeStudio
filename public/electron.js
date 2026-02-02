@@ -200,9 +200,6 @@ function createWindow() {
       `));
     }
 
-    // Открываем DevTools для отладки
-    mainWindow.webContents.openDevTools();
-
     // Логируем события окна
     mainWindow.on('closed', () => {
       writeLog('INFO', 'Main window closed');

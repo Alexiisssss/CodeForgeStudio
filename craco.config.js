@@ -1,14 +1,20 @@
-// Отключаем Node-модули в браузерной сборке (нужно для sql.js)
+// Конфиг CRACO, чтобы сборка CRA корректно работала с sql.js
+// и не требовала node-модуль `fs` в браузерном бандле.
+
 module.exports = {
   webpack: {
-    configure: (config) => {
-      config.resolve.fallback = config.resolve.fallback || {};
-      config.resolve.fallback.fs = false;
-      config.resolve.fallback.path = false;
-      config.resolve.fallback.crypto = false;
-      config.resolve.fallback.stream = false;
-      config.resolve.fallback.buffer = false;
-      return config;
-    }
-  }
+    configure: (webpackConfig) => {
+      // Отключаем требование node-модуля fs (и других, если понадобится)
+      webpackConfig.resolve = webpackConfig.resolve || {};
+      webpackConfig.resolve.fallback = {
+        ...(webpackConfig.resolve.fallback || {}),
+        fs: false,
+        path: false,
+        crypto: false,
+      };
+      return webpackConfig;
+    },
+  },
 };
+
+
