@@ -1,9 +1,9 @@
 {
-  "name": "modern-notepad",
+  "name": "codeforge-studio",
   "version": "1.0.0",
   "description": "Современный блокнот с возможностью компиляции кода",
   "author": "Aleksey Volkov",
-  "repository": "https://github.com/ваш-логин/блокнот",
+  "repository": "https://github.com/Alexiisssss/CodeForgeStudio",
   "homepage": ".",
   "main": "public/electron.js",
   "scripts": {
