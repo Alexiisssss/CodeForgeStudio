@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { spawn, exec } = require('child_process');
@@ -255,6 +255,75 @@ app.on('ready', () => {
 
 app.on('before-quit', () => {
   writeLog('INFO', 'Application before quit');
+});
+
+// IPC обработчики для работы с файлами (Открыть / Сохранить / Сохранить как)
+ipcMain.handle('file-open', async () => {
+  try {
+    const { canceled, filePaths } = await dialog.showOpenDialog({
+      properties: ['openFile'],
+      filters: [
+        { name: 'All Text', extensions: ['txt', 'md', 'js', 'ts', 'py', 'java', 'cpp', 'cs', 'sql', '*'] }
+      ]
+    });
+    if (canceled || !filePaths || !filePaths[0]) return { canceled: true };
+
+    const filePath = filePaths[0];
+    const content = fs.readFileSync(filePath, 'utf8');
+    return { canceled: false, filePath, content };
+  } catch (e) {
+    writeLog('ERROR', `Ошибка открытия файла: ${e.message}`, e);
+    return { canceled: true, error: e.message };
+  }
+});
+
+ipcMain.handle('file-save', async (event, { filePath, content }) => {
+  try {
+    if (!filePath) {
+      const { canceled, filePath: newPath } = await dialog.showSaveDialog({
+        filters: [
+          { name: 'All Text', extensions: ['txt', 'md', 'js', 'ts', 'py', 'java', 'cpp', 'cs', 'sql', '*'] }
+        ]
+      });
+      if (canceled || !newPath) return { canceled: true };
+      filePath = newPath;
+    }
+    fs.writeFileSync(filePath, content ?? '', 'utf8');
+    return { canceled: false, filePath };
+  } catch (e) {
+    writeLog('ERROR', `Ошибка сохранения файла: ${e.message}`, e);
+    return { canceled: true, error: e.message };
+  }
+});
+
+ipcMain.handle('file-save-as', async (event, { content }) => {
+  try {
+    const { canceled, filePath } = await dialog.showSaveDialog({
+      filters: [
+        { name: 'All Text', extensions: ['txt', 'md', 'js', 'ts', 'py', 'java', 'cpp', 'cs', 'sql', '*'] }
+      ]
+    });
+    if (canceled || !filePath) return { canceled: true };
+    fs.writeFileSync(filePath, content ?? '', 'utf8');
+    return { canceled: false, filePath };
+  } catch (e) {
+    writeLog('ERROR', `Ошибка сохранения файла (Save As): ${e.message}`, e);
+    return { canceled: true, error: e.message };
+  }
+});
+
+// Открытие файла по прямому пути (для списка «Недавние файлы»)
+ipcMain.handle('file-open-path', async (event, filePath) => {
+  try {
+    if (!filePath || !fs.existsSync(filePath)) {
+      return { canceled: true, error: 'Файл не найден' };
+    }
+    const content = fs.readFileSync(filePath, 'utf8');
+    return { canceled: false, filePath, content };
+  } catch (e) {
+    writeLog('ERROR', `Ошибка открытия файла по пути: ${e.message}`, e);
+    return { canceled: true, error: e.message };
+  }
 });
 
 // IPC обработчики для выполнения кода

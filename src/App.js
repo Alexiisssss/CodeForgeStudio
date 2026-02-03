@@ -8,13 +8,11 @@ import { html } from '@codemirror/lang-html';
 import { css } from '@codemirror/lang-css';
 import { go } from '@codemirror/lang-go';
 import { oneDark } from '@codemirror/theme-one-dark';
-import { EditorView } from '@codemirror/view';
+import { EditorView, keymap, highlightActiveLine, highlightActiveLineGutter, Decoration, ViewPlugin, WidgetType } from '@codemirror/view';
 
 import { syntaxHighlighting, HighlightStyle } from '@codemirror/language';
 import { tags } from '@lezer/highlight';
 import { autocompletion, CompletionContext } from '@codemirror/autocomplete';
-import { keymap } from '@codemirror/view';
-import { Decoration, ViewPlugin, WidgetType } from '@codemirror/view';
 import { StateField, EditorState, EditorSelection } from '@codemirror/state';
 import { selectAll, toggleComment } from '@codemirror/commands';
 import { bracketMatching, foldGutter, foldKeymap } from '@codemirror/language';
@@ -54,7 +52,7 @@ function App() {
   const [showHotkeys, setShowHotkeys] = useState(true);
   const [showThemeDropdown, setShowThemeDropdown] = useState(false);
   const themeDropdownRef = useRef(null);
-  const [tabs, setTabs] = useState([{ id: 'tab-1', name: 'Вкладка 1', code: '', output: '', language: 'javascript' }]); // Вкладки для single view: [{id, name, code, output, language}]
+  const [tabs, setTabs] = useState([{ id: 'tab-1', name: 'Вкладка 1', code: '', output: '', language: 'javascript', filePath: null, dirty: false }]); // Вкладки для single view: [{id, name, code, output, language, filePath, dirty}]
   const [activeTab, setActiveTab] = useState('tab-1');
   const [autoSaveEnabled, setAutoSaveEnabled] = useState(true);
   // Режим SQL: специальный режим для работы с запросами и таблицами
@@ -85,9 +83,9 @@ function App() {
   const [code1, setCode1] = useState('');
   const [code2, setCode2] = useState('');
   // Вкладки для каждого окна в split view
-  const [tabs1, setTabs1] = useState([{ id: 'tab1-1', name: 'Вкладка 1', code: '', output: '', language: 'javascript' }]);
+  const [tabs1, setTabs1] = useState([{ id: 'tab1-1', name: 'Вкладка 1', code: '', output: '', language: 'javascript', filePath: null, dirty: false }]);
   const [activeTab1, setActiveTab1] = useState('tab1-1');
-  const [tabs2, setTabs2] = useState([{ id: 'tab2-1', name: 'Вкладка 1', code: '', output: '', language: 'javascript' }]);
+  const [tabs2, setTabs2] = useState([{ id: 'tab2-1', name: 'Вкладка 1', code: '', output: '', language: 'javascript', filePath: null, dirty: false }]);
   const [activeTab2, setActiveTab2] = useState('tab2-1');
   const [output1, setOutput1] = useState('');
   const [output2, setOutput2] = useState('');
@@ -129,6 +127,15 @@ function App() {
   const [useSpaces, setUseSpaces] = useState(true); // Использовать пробелы вместо табов
   const [tabSize, setTabSize] = useState(4); // Размер табуляции
   const [showMinimap, setShowMinimap] = useState(true); // Показывать мини-карту
+  const [recentFiles, setRecentFiles] = useState(() => {
+    try {
+      const raw = localStorage.getItem('codeforge_recent_files');
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (_) {
+      return [];
+    }
+  });
   
   const editorRef = useRef(null);
   const editorRef1 = useRef(null);
@@ -144,6 +151,45 @@ function App() {
   const sqlJsInitPromiseRef = useRef(null);
   // Отдельный код для каждого диалекта SQL (sql / postgres / oracle)
   const codeByDialectRef = useRef({ sql: '', postgres: '', oracle: '' });
+
+  // Вспомогательная функция: имя файла из полного пути
+  const getFileNameFromPath = (filePath) => {
+    if (!filePath || typeof filePath !== 'string') return '';
+    const parts = filePath.split(/[/\\]/);
+    return parts[parts.length - 1] || filePath;
+  };
+
+  // Текущий контекст редактора (single view или левое окно split view)
+  const getCurrentEditorContext = () => {
+    if (splitView) {
+      return {
+        tabs: tabs1,
+        activeTabId: activeTab1,
+        code: code1,
+        setCode: setCode1,
+        setTabs: setTabs1,
+      };
+    }
+    return {
+      tabs,
+      activeTabId: activeTab,
+      code,
+      setCode,
+      setTabs,
+    };
+  };
+
+  const addRecentFile = (filePath) => {
+    if (!filePath || typeof filePath !== 'string') return;
+    setRecentFiles(prev => {
+      const filtered = prev.filter(p => p !== filePath);
+      const next = [filePath, ...filtered].slice(0, 10);
+      try {
+        localStorage.setItem('codeforge_recent_files', JSON.stringify(next));
+      } catch (_) {}
+      return next;
+    });
+  };
 
   const languages = [
     { value: 'text', label: 'Text' },
@@ -1931,6 +1977,137 @@ function App() {
     }
   };
 
+  // Работа с файлами: Открыть / Сохранить / Сохранить как
+  const handleOpenFile = async () => {
+    if (!ipcRenderer) return;
+    try {
+      const result = await ipcRenderer.invoke('file-open');
+      if (!result || result.canceled || !result.filePath) return;
+      const { filePath, content } = result;
+      const fileName = getFileNameFromPath(filePath);
+      const ctx = getCurrentEditorContext();
+      const text = typeof content === 'string' ? content : '';
+      ctx.setCode(text);
+      ctx.setTabs(prev => prev.map(tab =>
+        tab.id === ctx.activeTabId
+          ? { ...tab, code: text, filePath, name: fileName || tab.name, dirty: false }
+          : tab
+      ));
+      addRecentFile(filePath);
+    } catch (_) {}
+  };
+
+  const saveFileInternal = async (saveAs = false) => {
+    if (!ipcRenderer) return;
+    const ctx = getCurrentEditorContext();
+    const currentTab = ctx.tabs.find(t => t.id === ctx.activeTabId);
+    if (!currentTab) return;
+    let filePath = currentTab.filePath;
+    const content = ctx.code ?? '';
+    const channel = saveAs || !filePath ? 'file-save-as' : 'file-save';
+    const payload = channel === 'file-save-as' ? { content } : { filePath, content };
+    try {
+      const result = await ipcRenderer.invoke(channel, payload);
+      if (!result || result.canceled || !result.filePath) return;
+      filePath = result.filePath;
+      const fileName = getFileNameFromPath(filePath);
+      if (splitView) {
+        setTabs1(prev => prev.map(tab =>
+          tab.id === ctx.activeTabId ? { ...tab, filePath, name: fileName || tab.name, dirty: false } : tab
+        ));
+      } else {
+        setTabs(prev => prev.map(tab =>
+          tab.id === ctx.activeTabId ? { ...tab, filePath, name: fileName || tab.name, dirty: false } : tab
+        ));
+      }
+      addRecentFile(filePath);
+    } catch (_) {}
+  };
+
+  const handleSaveFile = () => {
+    saveFileInternal(false);
+  };
+
+  const handleSaveFileAs = () => {
+    saveFileInternal(true);
+  };
+
+  const handleOpenRecent = async (filePath) => {
+    if (!ipcRenderer || !filePath) return;
+    try {
+      const result = await ipcRenderer.invoke('file-open-path', filePath);
+      if (!result || result.canceled || !result.filePath) return;
+      const { content } = result;
+      const fileName = getFileNameFromPath(filePath);
+      const ctx = getCurrentEditorContext();
+      const text = typeof content === 'string' ? content : '';
+      ctx.setCode(text);
+      ctx.setTabs(prev => prev.map(tab =>
+        tab.id === ctx.activeTabId
+          ? { ...tab, code: text, filePath, name: fileName || tab.name, dirty: false }
+          : tab
+      ));
+      addRecentFile(filePath);
+    } catch (_) {}
+  };
+
+  // Работа с файлами для правого окна split view
+  const getRightEditorContext = () => ({
+    tabs: tabs2,
+    activeTabId: activeTab2,
+    code: code2,
+    setCode: setCode2,
+    setTabs: setTabs2,
+  });
+
+  const handleOpenFileRight = async () => {
+    if (!ipcRenderer || !splitView) return;
+    try {
+      const result = await ipcRenderer.invoke('file-open');
+      if (!result || result.canceled || !result.filePath) return;
+      const { filePath, content } = result;
+      const fileName = getFileNameFromPath(filePath);
+      const ctx = getRightEditorContext();
+      const text = typeof content === 'string' ? content : '';
+      ctx.setCode(text);
+      ctx.setTabs(prev => prev.map(tab =>
+        tab.id === ctx.activeTabId
+          ? { ...tab, code: text, filePath, name: fileName || tab.name, dirty: false }
+          : tab
+      ));
+      addRecentFile(filePath);
+    } catch (_) {}
+  };
+
+  const saveFileRightInternal = async (saveAs = false) => {
+    if (!ipcRenderer || !splitView) return;
+    const ctx = getRightEditorContext();
+    const currentTab = ctx.tabs.find(t => t.id === ctx.activeTabId);
+    if (!currentTab) return;
+    let filePath = currentTab.filePath;
+    const content = ctx.code ?? '';
+    const channel = saveAs || !filePath ? 'file-save-as' : 'file-save';
+    const payload = channel === 'file-save-as' ? { content } : { filePath, content };
+    try {
+      const result = await ipcRenderer.invoke(channel, payload);
+      if (!result || result.canceled || !result.filePath) return;
+      filePath = result.filePath;
+      const fileName = getFileNameFromPath(filePath);
+      setTabs2(prev => prev.map(tab =>
+        tab.id === ctx.activeTabId ? { ...tab, filePath, name: fileName || tab.name, dirty: false } : tab
+      ));
+      addRecentFile(filePath);
+    } catch (_) {}
+  };
+
+  const handleSaveFileRight = () => {
+    saveFileRightInternal(false);
+  };
+
+  const handleSaveFileAsRight = () => {
+    saveFileRightInternal(true);
+  };
+
   // Функции выполнения для окна 1 (overrideCode — при автозапуске передаём актуальный код из таймера)
   const executeCode1 = async (overrideCode) => {
     if (isRunning1) return;
@@ -2927,14 +3104,16 @@ function App() {
     const langToSave = language;
     setTabs(prev => {
       const withCurrentSaved = prev.map(tab =>
-        tab.id === activeTab ? { ...tab, code: codeToSave, output: outputToSave, language: langToSave } : tab
+        tab.id === activeTab ? { ...tab, code: codeToSave, output: outputToSave, language: langToSave, dirty: false } : tab
       );
       const newTab = {
         id: newTabId,
         name: nextTabName(withCurrentSaved),
         code: '',
         output: '',
-        language: langToSave
+        language: langToSave,
+        filePath: null,
+        dirty: false
       };
       return [...withCurrentSaved, newTab];
     });
@@ -2945,6 +3124,12 @@ function App() {
   }, [tabs, language, activeTab, code, output, nextTabName]);
 
   const closeTab = useCallback((tabId) => {
+    const tab = tabs.find(t => t.id === tabId);
+    if (!tab) return;
+    if (tab.dirty) {
+      const ok = window.confirm(`Вкладка "${tab.name}" содержит несохранённые изменения. Закрыть без сохранения?`);
+      if (!ok) return;
+    }
     if (tabs.length === 1) return;
     const closedIndex = tabs.findIndex(t => t.id === tabId);
     if (closedIndex === -1) return; // вкладки нет — ничего не делаем
@@ -2983,14 +3168,16 @@ function App() {
     const langToSave = language1;
     setTabs1(prev => {
       const withCurrentSaved = prev.map(tab =>
-        tab.id === activeTab1 ? { ...tab, code: codeToSave, output: outputToSave, language: langToSave } : tab
+        tab.id === activeTab1 ? { ...tab, code: codeToSave, output: outputToSave, language: langToSave, dirty: false } : tab
       );
       const newTab = {
         id: newTabId,
         name: nextTabName(withCurrentSaved),
         code: '',
         output: '',
-        language: langToSave
+        language: langToSave,
+        filePath: null,
+        dirty: false
       };
       return [...withCurrentSaved, newTab];
     });
@@ -3001,6 +3188,12 @@ function App() {
   }, [tabs1, language1, activeTab1, code1, output1, nextTabName]);
 
   const closeTab1 = useCallback((tabId) => {
+    const tab = tabs1.find(t => t.id === tabId);
+    if (!tab) return;
+    if (tab.dirty) {
+      const ok = window.confirm(`Вкладка "${tab.name}" содержит несохранённые изменения. Закрыть без сохранения?`);
+      if (!ok) return;
+    }
     if (tabs1.length === 1) return;
     const closedIndex = tabs1.findIndex(t => t.id === tabId);
     if (closedIndex === -1) return;
@@ -3038,14 +3231,16 @@ function App() {
     const langToSave = language2;
     setTabs2(prev => {
       const withCurrentSaved = prev.map(tab =>
-        tab.id === activeTab2 ? { ...tab, code: codeToSave, output: outputToSave, language: langToSave } : tab
+        tab.id === activeTab2 ? { ...tab, code: codeToSave, output: outputToSave, language: langToSave, dirty: false } : tab
       );
       const newTab = {
         id: newTabId,
         name: nextTabName(withCurrentSaved),
         code: '',
         output: '',
-        language: langToSave
+        language: langToSave,
+        filePath: null,
+        dirty: false
       };
       return [...withCurrentSaved, newTab];
     });
@@ -3056,6 +3251,12 @@ function App() {
   }, [tabs2, language2, activeTab2, code2, output2, nextTabName]);
 
   const closeTab2 = useCallback((tabId) => {
+    const tab = tabs2.find(t => t.id === tabId);
+    if (!tab) return;
+    if (tab.dirty) {
+      const ok = window.confirm(`Вкладка "${tab.name}" содержит несохранённые изменения. Закрыть без сохранения?`);
+      if (!ok) return;
+    }
     if (tabs2.length === 1) return;
     const closedIndex = tabs2.findIndex(t => t.id === tabId);
     if (closedIndex === -1) return;
@@ -3471,6 +3672,34 @@ function App() {
           <div className="app-brand">
             <h1 className="app-title">CodeForge Studio</h1>
             <span className="app-creator">Developer · Aleksey Volkov</span>
+          </div>
+          <div style={{ display: 'flex', gap: '6px', marginLeft: '12px', alignItems: 'center' }}>
+            <button className="btn btn-secondary" onClick={handleOpenFile} title="Открыть файл в текущую вкладку">
+              Открыть
+            </button>
+            <button className="btn btn-secondary" onClick={handleSaveFile} title="Сохранить файл">
+              Сохранить
+            </button>
+            <button className="btn btn-secondary" onClick={handleSaveFileAs} title="Сохранить как...">
+              Сохранить как
+            </button>
+            {recentFiles.length > 0 && (
+              <select
+                className="language-select"
+                style={{ marginLeft: '8px', maxWidth: '220px' }}
+                value=""
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (!v) return;
+                  handleOpenRecent(v);
+                }}
+              >
+                <option value="">Недавние файлы</option>
+                {recentFiles.map((p) => (
+                  <option key={p} value={p}>{getFileNameFromPath(p)}</option>
+                ))}
+              </select>
+            )}
           </div>
           {!splitView && (
             <select 
@@ -4074,7 +4303,7 @@ function App() {
                               }}
                               title={tab.name}
                             >
-                              {tab.name}
+                              {tab.name}{tab.dirty ? ' •' : ''}
                               {tabs1.length > 1 && (
                                 <span
                                   onClick={(e) => {
@@ -4157,6 +4386,8 @@ function App() {
                       ...indentExtension,
                       ...enhancedBracketMatching,
                       ...minimapExtension,
+                      highlightActiveLineGutter(),
+                      highlightActiveLine(),
                       keymap.of([
                         { key: 'Mod-a', run: selectAll },
                         {
@@ -4256,6 +4487,9 @@ function App() {
                       }
                       if (typeof str !== 'string' || str.includes('[object Object]')) return;
                       setCode1(str);
+                      setTabs1(prev => prev.map(tab =>
+                        tab.id === activeTab1 ? { ...tab, code: str, dirty: true } : tab
+                      ));
                       if (sqlMode) codeByDialectRef.current[sqlDialect] = str;
                       if (autoDetectTimerRef.current) clearTimeout(autoDetectTimerRef.current);
                       if (!sqlMode && Date.now() < skipAutoDetectUntilRef.current) return;
@@ -4818,7 +5052,7 @@ function App() {
                                   }}
                                   title={tab.name}
                                 >
-                                  {tab.name}
+                                  {tab.name}{tab.dirty ? ' •' : ''}
                                   {tabs2.length > 1 && (
                                     <span
                                       onClick={(e) => {
@@ -4846,6 +5080,30 @@ function App() {
                             title="Очистить код (с подтверждением)"
                           >
                             🗑️ Очистить
+                          </button>
+                          <button 
+                            className="btn btn-secondary"
+                            onClick={handleOpenFileRight}
+                            style={{ padding: '4px 10px', fontSize: '12px' }}
+                            title="Открыть файл в правое окно"
+                          >
+                            Открыть
+                          </button>
+                          <button 
+                            className="btn btn-secondary"
+                            onClick={handleSaveFileRight}
+                            style={{ padding: '4px 10px', fontSize: '12px' }}
+                            title="Сохранить файл (правое окно)"
+                          >
+                            Сохранить
+                          </button>
+                          <button 
+                            className="btn btn-secondary"
+                            onClick={handleSaveFileAsRight}
+                            style={{ padding: '4px 10px', fontSize: '12px' }}
+                            title="Сохранить как... (правое окно)"
+                          >
+                            Сохранить как
                           </button>
                           <button 
                             className={`btn btn-primary ${isRunning2 ? 'running' : ''}`}
@@ -4884,6 +5142,8 @@ function App() {
                           ...indentExtension,
                           ...enhancedBracketMatching,
                           ...minimapExtension,
+                          highlightActiveLineGutter(),
+                          highlightActiveLine(),
                           keymap.of([
                             { key: 'Mod-a', run: selectAll },
                             {
@@ -4975,6 +5235,9 @@ function App() {
                           }
                           if (typeof str !== 'string') return;
                           setCode2(str);
+                          setTabs2(prev => prev.map(tab =>
+                            tab.id === activeTab2 ? { ...tab, code: str, dirty: true } : tab
+                          ));
                           if (autoDetectTimerRef.current) clearTimeout(autoDetectTimerRef.current);
                           if (Date.now() < skipAutoDetectUntilRef.current) return;
                           autoDetectTimerRef.current = setTimeout(() => {
@@ -5099,7 +5362,7 @@ function App() {
                             }}
                             title={tab.name}
                           >
-                            {tab.name}
+                            {tab.name}{tab.dirty ? ' •' : ''}
                             {tabs.length > 1 && (
                               <span
                                 role="button"
@@ -5149,6 +5412,8 @@ function App() {
                     ...enhancedBracketMatching,
                     ...minimapExtension,
                     ...errorHighlightExtension,
+                    highlightActiveLineGutter(),
+                    highlightActiveLine(),
                     keymap.of([
                       { key: 'Mod-a', run: selectAll },
                       {
@@ -5240,6 +5505,9 @@ function App() {
                     }
                     if (typeof str !== 'string') return;
                     setCode(str);
+                    setTabs(prev => prev.map(tab =>
+                      tab.id === activeTab ? { ...tab, code: str, dirty: true } : tab
+                    ));
                     if (autoDetectTimerRef.current) clearTimeout(autoDetectTimerRef.current);
                     if (Date.now() < skipAutoDetectUntilRef.current) return;
                     autoDetectTimerRef.current = setTimeout(() => {
@@ -5399,10 +5667,10 @@ function App() {
                     return tab ? { ...tab, id: `tab2-${Date.now()}-${tabId}` } : null;
                   }).filter(Boolean);
                   if (tabs1Selected.length === 0) {
-                    tabs1Selected.push({ id: 'tab1-1', name: 'Вкладка 1', code: '', output: '', language: language });
+                    tabs1Selected.push({ id: 'tab1-1', name: 'Вкладка 1', code: '', output: '', language: language, filePath: null, dirty: false });
                   }
                   if (tabs2Selected.length === 0) {
-                    tabs2Selected.push({ id: 'tab2-1', name: 'Вкладка 1', code: '', output: '', language: language });
+                    tabs2Selected.push({ id: 'tab2-1', name: 'Вкладка 1', code: '', output: '', language: language, filePath: null, dirty: false });
                   }
                   setTabs1(tabs1Selected);
                   setTabs2(tabs2Selected);
