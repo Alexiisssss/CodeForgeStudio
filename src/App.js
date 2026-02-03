@@ -1308,6 +1308,91 @@ function App() {
       background: '#f8f8f8', foreground: '#404040', gutterBg: '#f0f0f0', gutterFg: '#a0a0a0',
       cursor: '#404040', selection: '#d8d8e8', border: '#e0e0e0', dark: false
     })},
+    // --- 20 новых тёмных тем ---
+    { value: 'deepOcean', label: 'Deep Ocean', theme: createTheme('deepOcean', {
+      background: '#0a0e14', foreground: '#b3c6d4', gutterBg: '#060a0f', gutterFg: '#3d4f5c',
+      cursor: '#5dd4ff', selection: '#1a2a3a', border: '#0f1820', dark: true
+    })},
+    { value: 'terminalGreen', label: 'Terminal Green', theme: createTheme('terminalGreen', {
+      background: '#0d1110', foreground: '#33ff66', gutterBg: '#080c0a', gutterFg: '#2a5533',
+      cursor: '#33ff66', selection: '#1a3320', border: '#152018', dark: true
+    })},
+    { value: 'bloodMoon', label: 'Blood Moon', theme: createTheme('bloodMoon', {
+      background: '#1c0a0a', foreground: '#e8c4c4', gutterBg: '#150606', gutterFg: '#6a4040',
+      cursor: '#ff6060', selection: '#2a1010', border: '#251010', dark: true
+    })},
+    { value: 'purpleHaze', label: 'Purple Haze', theme: createTheme('purpleHaze', {
+      background: '#120a18', foreground: '#d8c0e8', gutterBg: '#0d0612', gutterFg: '#5a4070',
+      cursor: '#c080ff', selection: '#1e1028', border: '#181020', dark: true
+    })},
+    { value: 'steelGray', label: 'Steel Gray', theme: createTheme('steelGray', {
+      background: '#1a1d21', foreground: '#c8ccd0', gutterBg: '#141618', gutterFg: '#5a6068',
+      cursor: '#88a0b0', selection: '#2a3038', border: '#252a30', dark: true
+    })},
+    { value: 'carbon', label: 'Carbon', theme: createTheme('carbon', {
+      background: '#161616', foreground: '#e0e0e0', gutterBg: '#0f0f0f', gutterFg: '#525252',
+      cursor: '#00ff88', selection: '#262626', border: '#2a2a2a', dark: true
+    })},
+    { value: 'noir', label: 'Noir', theme: createTheme('noir', {
+      background: '#0c0c0c', foreground: '#d0d0d0', gutterBg: '#080808', gutterFg: '#404040',
+      cursor: '#ffffff', selection: '#1f1f1f', border: '#181818', dark: true
+    })},
+    { value: 'forestNight', label: 'Forest Night', theme: createTheme('forestNight', {
+      background: '#0f1410', foreground: '#a8c4a0', gutterBg: '#0a100c', gutterFg: '#4a6048',
+      cursor: '#70c060', selection: '#182818', border: '#141c14', dark: true
+    })},
+    { value: 'copper', label: 'Copper', theme: createTheme('copper', {
+      background: '#1a1510', foreground: '#e0c8a8', gutterBg: '#141008', gutterFg: '#6a5840',
+      cursor: '#d09050', selection: '#2a2015', border: '#201810', dark: true
+    })},
+    { value: 'slate', label: 'Slate', theme: createTheme('slate', {
+      background: '#14181c', foreground: '#b8c4d0', gutterBg: '#0f1216', gutterFg: '#4a5660',
+      cursor: '#78a0c0', selection: '#1c2430', border: '#1a2028', dark: true
+    })},
+    { value: 'ink', label: 'Ink', theme: createTheme('ink', {
+      background: '#0e0e12', foreground: '#c4c0d8', gutterBg: '#0a0a0e', gutterFg: '#505068',
+      cursor: '#9080e0', selection: '#1a1828', border: '#141218', dark: true
+    })},
+    { value: 'ash', label: 'Ash', theme: createTheme('ash', {
+      background: '#181818', foreground: '#d8d4d0', gutterBg: '#121212', gutterFg: '#585450',
+      cursor: '#a0a090', selection: '#282420', border: '#22201c', dark: true
+    })},
+    { value: 'phoenix', label: 'Phoenix', theme: createTheme('phoenix', {
+      background: '#1a0c08', foreground: '#f0c0a0', gutterBg: '#140806', gutterFg: '#704830',
+      cursor: '#ff8040', selection: '#281410', border: '#201008', dark: true
+    })},
+    { value: 'void', label: 'Void', theme: createTheme('void', {
+      background: '#08080c', foreground: '#a0a0b0', gutterBg: '#050508', gutterFg: '#404050',
+      cursor: '#6060ff', selection: '#101018', border: '#0c0c12', dark: true
+    })},
+    { value: 'moss', label: 'Moss', theme: createTheme('moss', {
+      background: '#0c140c', foreground: '#a0d0a0', gutterBg: '#081008', gutterFg: '#406040',
+      cursor: '#60c060', selection: '#142018', border: '#101810', dark: true
+    })},
+    { value: 'emberDark', label: 'Ember Dark', theme: createTheme('emberDark', {
+      background: '#150a08', foreground: '#e8b8a8', gutterBg: '#100606', gutterFg: '#604840',
+      cursor: '#ff7040', selection: '#201210', border: '#180c08', dark: true
+    })},
+    { value: 'graphite', label: 'Graphite', theme: createTheme('graphite', {
+      background: '#1c1c1c', foreground: '#d4d4d4', gutterBg: '#141414', gutterFg: '#606060',
+      cursor: '#909090', selection: '#303030', border: '#282828', dark: true
+    })},
+    { value: 'midnightForest', label: 'Midnight Forest', theme: createTheme('midnightForest', {
+      background: '#0a1210', foreground: '#90b8a8', gutterBg: '#060c0a', gutterFg: '#385048',
+      cursor: '#50a080', selection: '#0e1a18', border: '#0e1614', dark: true
+    })},
+    { value: 'crimson', label: 'Crimson', theme: createTheme('crimson', {
+      background: '#140808', foreground: '#e8b0b0', gutterBg: '#0f0505', gutterFg: '#604040',
+      cursor: '#e05050', selection: '#201010', border: '#180808', dark: true
+    })},
+    { value: 'arcticNight', label: 'Arctic Night', theme: createTheme('arcticNight', {
+      background: '#0c1014', foreground: '#b0c8e0', gutterBg: '#080c10', gutterFg: '#405060',
+      cursor: '#80b0e0', selection: '#141c28', border: '#101418', dark: true
+    })},
+    { value: 'warmGray', label: 'Warm Gray', theme: createTheme('warmGray', {
+      background: '#1a1816', foreground: '#d8d0c8', gutterBg: '#141210', gutterFg: '#605850',
+      cursor: '#c0a080', selection: '#282420', border: '#201c18', dark: true
+    })},
   ];
 
   // Получаем цвета синтаксиса для темы

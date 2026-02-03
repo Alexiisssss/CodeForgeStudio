@@ -52,6 +52,8 @@ Desktop.ini
 # Cache / Temp
 .cache/
 .eslintcache
+.stylelintcache
+.prettiercache
 *.tmp
 *.temp
 .tmp/
@@ -60,6 +62,19 @@ Desktop.ini
 # Electron
 dist/
 release/
+*.exe
+*.msi
+*.dmg
+*.AppImage
+
+# Node
+.node_repl_history
+*.pid
+*.seed
+.npmrc.local
+
+# Optional: раскомментируйте, если не хотите коммитить бинарники
+# public/sql-wasm.wasm
 
 # Misc
 *.bak
