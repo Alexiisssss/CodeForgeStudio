@@ -113,8 +113,8 @@ npm run electron-pack-win
 
 ## 💬 Обратная связь
 
-- **[Issues](issues)** — баги и идеи
-- **[Discussions](discussions)** — обсуждения и вопросы
+- **[Issues](https://github.com/Alexiisssss/CodeForgeStudio/issues)** — баги и идеи
+- **[Discussions](https://github.com/Alexiisssss/CodeForgeStudio/discussions)** — обсуждения и вопросы
 
 ---
 
