@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, globalShortcut } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { spawn, exec } = require('child_process');
@@ -226,6 +226,13 @@ app.whenReady().then(() => {
   writeLog('INFO', `User data path: ${app.getPath('userData')}`);
   writeLog('INFO', `Log file: ${logPath}`);
   createWindow();
+  // Глобальный хоткей Ctrl+Alt+L — иначе на Windows комбинация может не доходить до окна
+  const ok = globalShortcut.register('Control+Alt+L', () => {
+    if (mainWindow && !mainWindow.isDestroyed() && mainWindow.webContents) {
+      mainWindow.webContents.send('trigger-format-java');
+    }
+  });
+  if (!ok) writeLog('WARN', 'Не удалось зарегистрировать глобальный хоткей Control+Alt+L');
 }).catch((error) => {
   writeLog('ERROR', 'Error in app.whenReady', error);
 });
@@ -254,6 +261,7 @@ app.on('ready', () => {
 });
 
 app.on('before-quit', () => {
+  globalShortcut.unregisterAll();
   writeLog('INFO', 'Application before quit');
 });
 
@@ -326,7 +334,7 @@ ipcMain.handle('file-open-path', async (event, filePath) => {
   }
 });
 
-// Форматирование Java-кода через google-java-format (если установлен в системе)
+// Форматирование Java-кода через google-java-format (JAR из tools/ или из PATH)
 ipcMain.handle('format-java', async (event, code) => {
   return new Promise((resolve) => {
     if (!code || typeof code !== 'string' || !code.trim()) {
@@ -334,17 +342,62 @@ ipcMain.handle('format-java', async (event, code) => {
       return;
     }
 
+    // Приводим к валидному Java вид комментарии с пробелами между слэшами: " /  / " → "//"
+    let normalizedCode = code.replace(/^(\s*)\/\s+\/\s*/gm, '$1//');
+
+    const appDir = app.getAppPath();
+    const resourcesDir = process.resourcesPath || appDir;
+    const toolsDirs = [
+      path.join(appDir, 'tools'),
+      path.join(resourcesDir, 'tools')
+    ];
+    let jarPath = null;
+    for (const dir of toolsDirs) {
+      if (!fs.existsSync(dir)) continue;
+      try {
+        const files = fs.readdirSync(dir);
+        const jar = files.find((f) => /^google-java-format-[\d.]+-all-deps\.jar$/i.test(f));
+        if (jar) {
+          jarPath = path.join(dir, jar);
+          break;
+        }
+      } catch (_) {}
+    }
+    const useLocalJar = !!jarPath;
+
     let formatter;
     try {
-      // Ожидаем, что google-java-format доступен в PATH
-      formatter = spawn('google-java-format', ['-'], {
-        shell: true,
-        encoding: 'utf8'
-      });
+      if (useLocalJar) {
+        const formatterHome = process.env.JAVA_FORMATTER_HOME || process.env.JAVA_HOME;
+        const isWin = os.platform() === 'win32';
+        const javaExeName = isWin ? 'java.exe' : 'java';
+        const javaCmd = formatterHome
+          ? path.join(formatterHome, 'bin', javaExeName)
+          : 'java';
+        if (formatterHome) {
+          if (!fs.existsSync(javaCmd)) {
+            resolve({
+              error: `Java не найден по пути: ${javaCmd}\nПроверьте переменные JAVA_HOME и JAVA_FORMATTER_HOME (должны указывать на папку JDK, например C:\\Program Files\\Java\\jdk-21).`
+            });
+            return;
+          }
+        }
+        const cwdDir = path.dirname(jarPath);
+        formatter = spawn(javaCmd, ['-jar', jarPath, '-'], {
+          shell: formatterHome ? false : true,
+          encoding: 'utf8',
+          cwd: cwdDir
+        });
+      } else {
+        formatter = spawn('google-java-format', ['-'], {
+          shell: true,
+          encoding: 'utf8'
+        });
+      }
     } catch (e) {
       writeLog('ERROR', `Не удалось запустить google-java-format: ${e.message}`, e);
       resolve({
-        error: 'google-java-format не найден. Установите его и добавьте в PATH.\nПодробнее: https://github.com/google/google-java-format'
+        error: 'google-java-format не найден. Положите JAR в папку tools/ или добавьте в PATH.\nПодробнее: https://github.com/google/google-java-format'
       });
       return;
     }
@@ -370,16 +423,23 @@ ipcMain.handle('format-java', async (event, code) => {
 
     formatter.on('error', (err) => {
       writeLog('ERROR', `Ошибка запуска google-java-format: ${err.message}`, err);
-      resolve({
-        error: 'Не удалось запустить google-java-format. Проверьте, что он установлен и доступен в PATH.'
-      });
+      let msg = 'Не удалось запустить google-java-format. ';
+      if (err.code === 'ENOENT') {
+        msg += 'Команда java не найдена. Задайте переменную JAVA_HOME (или JAVA_FORMATTER_HOME) — путь к папке JDK (например C:\\Program Files\\Java\\jdk-21). Если приложение запущено с ярлыка/меню Пуск, PATH может не содержать Java — тогда JAVA_HOME обязателен.';
+      } else {
+        msg += `Ошибка: ${err.message}. Проверьте, что JAR лежит в tools/ и задан JAVA_HOME при необходимости.`;
+      }
+      resolve({ error: msg });
     });
 
     formatter.on('close', (exitCode) => {
       if (exitCode === 0 && output) {
         resolve({ formatted: output });
       } else {
-        const msg = error || `google-java-format завершился с кодом ${exitCode}`;
+        let msg = error || `google-java-format завершился с кодом ${exitCode}`;
+        if (/JCAnyPattern|NoClassDefFoundError|ClassNotFoundException/.test(msg)) {
+          msg += '\n\nНесовместимость версии JDK. Форматтер 1.29+ рассчитан на JDK 21. Варианты:\n• Установите JDK 21 и задайте переменную JAVA_FORMATTER_HOME=c:\\путь\\к\\jdk-21 — тогда форматтер будет использовать именно его (остальной код может работать на JDK 25).\n• Либо при JDK 17 положите в tools JAR 1.28: https://github.com/google/google-java-format/releases/tag/v1.28.0';
+        }
         resolve({
           error: `Ошибка форматирования Java-кода через google-java-format:\n${msg}`
         });
@@ -387,7 +447,7 @@ ipcMain.handle('format-java', async (event, code) => {
     });
 
     try {
-      formatter.stdin.write(code);
+      formatter.stdin.write(normalizedCode);
       formatter.stdin.end();
     } catch (e) {
       writeLog('ERROR', `Ошибка записи кода в google-java-format: ${e.message}`, e);

@@ -86,8 +86,8 @@ In **Split view**, the right pane has its own **Open / Save / Save As** for the 
 
 - JavaScript (runs in browser)
 - TypeScript, Python, Java, Go, C++, C#
-+- HTML, CSS
-+- Plain text (no syntax highlighting)
+- HTML, CSS
+- Plain text (no syntax highlighting)
 
 ## ⌨️ Shortcuts
 
@@ -104,8 +104,8 @@ In **Split view**, the right pane has its own **Open / Save / Save As** for the 
 ## 📝 Notes
 
 - JavaScript runs in the browser; **Java, Python, C++, C#, Go** run via Electron (main process). They do not run in the browser without Electron.
-- For Java / C++ / C# / Go you need the corresponding compilers/interpreters in PATH (JDK, Python, g++/MSVC, .NET SDK, Go).
-- For **clean Java code**, you can use `google-java-format` (if installed and available in PATH): press `Ctrl+Alt+L` when the language is Java.
+- For Java / C++ / C# / Go you need the corresponding compilers/interpreters in PATH (JDK, Python, g++/MSVC, .NET SDK, Go). **JDK 21 is recommended for Java** — both code execution and formatting (google-java-format 1.29+) work without extra config. If you have multiple JDKs and the wrong one runs (e.g. due to Oracle javapath on Windows), set **JAVA_HOME** to the desired JDK or put its `bin` earlier in PATH.
+- For **clean Java code**, put a `google-java-format` JAR from [releases](https://github.com/google/google-java-format/releases) in the `tools/` folder and press `Ctrl+Alt+L` when the language is Java. **Versions 1.29+ target JDK 21**; on JDK 24/25 set **`JAVA_FORMATTER_HOME`** to your JDK 21 path. For JDK 17 use [JAR 1.28](https://github.com/google/google-java-format/releases/tag/v1.28.0).
 - There is a dedicated stdin field for Java: everything you type there is passed to `Scanner(System.in)` as standard input lines.
 - The editor is built on **CodeMirror 6** (@uiw/react-codemirror).
 

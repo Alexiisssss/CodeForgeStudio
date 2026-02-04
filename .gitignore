@@ -76,6 +76,12 @@ release/
 # Optional: раскомментируйте, если не хотите коммитить бинарники
 # public/sql-wasm.wasm
 
+# google-java-format — JAR скачивается по инструкции из README, в репо не коммитим
+tools/*.jar
+
+# Cursor IDE (опционально)
+.cursor/
+
 # Misc
 *.bak
 *.backup

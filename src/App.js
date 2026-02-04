@@ -23,7 +23,7 @@ const { ipcRenderer } = window.require ? window.require('electron') : { ipcRende
 function App() {
   const [code, setCode] = useState('');
   const [output, setOutput] = useState('');
-  const [javaInput, setJavaInput] = useState('');
+  // stdin для Java (Scanner) хранится в каждой вкладке как tab.stdin
   const [language, setLanguage] = useState('javascript');
   const [language1, setLanguage1] = useState('javascript'); // Язык для окна 1 в split view
   const [language2, setLanguage2] = useState('javascript'); // Язык для окна 2 в split view
@@ -53,7 +53,7 @@ function App() {
   const [showHotkeys, setShowHotkeys] = useState(true);
   const [showThemeDropdown, setShowThemeDropdown] = useState(false);
   const themeDropdownRef = useRef(null);
-  const [tabs, setTabs] = useState([{ id: 'tab-1', name: 'Вкладка 1', code: '', output: '', language: 'javascript', filePath: null, dirty: false }]); // Вкладки для single view: [{id, name, code, output, language, filePath, dirty}]
+  const [tabs, setTabs] = useState([{ id: 'tab-1', name: 'Вкладка 1', code: '', output: '', language: 'javascript', filePath: null, dirty: false, stdin: '' }]); // Вкладки: + stdin для Java Scanner
   const [activeTab, setActiveTab] = useState('tab-1');
   const [autoSaveEnabled, setAutoSaveEnabled] = useState(true);
   // Режим SQL: специальный режим для работы с запросами и таблицами
@@ -83,12 +83,11 @@ function App() {
   // Состояния для split view - независимые окна
   const [code1, setCode1] = useState('');
   const [code2, setCode2] = useState('');
-  const [javaInput1, setJavaInput1] = useState('');
-  const [javaInput2, setJavaInput2] = useState('');
+  // stdin для Java (Scanner) хранится в каждой вкладке: tab.stdin
   // Вкладки для каждого окна в split view
-  const [tabs1, setTabs1] = useState([{ id: 'tab1-1', name: 'Вкладка 1', code: '', output: '', language: 'javascript', filePath: null, dirty: false }]);
+  const [tabs1, setTabs1] = useState([{ id: 'tab1-1', name: 'Вкладка 1', code: '', output: '', language: 'javascript', filePath: null, dirty: false, stdin: '' }]);
   const [activeTab1, setActiveTab1] = useState('tab1-1');
-  const [tabs2, setTabs2] = useState([{ id: 'tab2-1', name: 'Вкладка 1', code: '', output: '', language: 'javascript', filePath: null, dirty: false }]);
+  const [tabs2, setTabs2] = useState([{ id: 'tab2-1', name: 'Вкладка 1', code: '', output: '', language: 'javascript', filePath: null, dirty: false, stdin: '' }]);
   const [activeTab2, setActiveTab2] = useState('tab2-1');
   const [output1, setOutput1] = useState('');
   const [output2, setOutput2] = useState('');
@@ -149,11 +148,34 @@ function App() {
   const editorViewRef = useRef(null);
   const createNewTabLockRef = useRef(0); // время последнего создания вкладки (для защиты от двойного клика)
   const CREATE_TAB_COOLDOWN_MS = 400;
+  const javaStdinRef = useRef(null);
+  const javaStdinRef1 = useRef(null);
+  const javaStdinRef2 = useRef(null);
   // In-memory SQLite (sql.js) для выполнения SQL
   const sqlJsDbRef = useRef(null);
   const sqlJsInitPromiseRef = useRef(null);
   // Отдельный код для каждого диалекта SQL (sql / postgres / oracle)
   const codeByDialectRef = useRef({ sql: '', postgres: '', oracle: '' });
+
+  // Подстраиваем высоту полей Scanner при смене вкладки или при уже заполненном тексте (в т.ч. в двух окнах)
+  const stdinMain = tabs.find(t => t.id === activeTab)?.stdin ?? '';
+  const stdin1 = tabs1.find(t => t.id === activeTab1)?.stdin ?? '';
+  const stdin2 = tabs2.find(t => t.id === activeTab2)?.stdin ?? '';
+  useEffect(() => {
+    const resize = (el) => {
+      if (!el) return;
+      el.style.height = 'auto';
+      el.style.height = el.scrollHeight + 'px';
+    };
+    const t = setTimeout(() => {
+      if (!splitView) resize(javaStdinRef.current);
+      else {
+        resize(javaStdinRef1.current);
+        resize(javaStdinRef2.current);
+      }
+    }, 0);
+    return () => clearTimeout(t);
+  }, [splitView, activeTab, activeTab1, activeTab2, stdinMain, stdin1, stdin2]);
 
   // Вспомогательная функция: имя файла из полного пути
   const getFileNameFromPath = (filePath) => {
@@ -233,9 +255,10 @@ function App() {
       (s.match(/\b(enum\s+\w+|readonly\s+|\.\?\w+|:\s*\w+\[\])\b/g) || []).length +
       (s.match(/\?\?|\b(Promise|Array|Map|Set)<\w*>/g) || []).length;
     if (tsScore >= 1) scores.typescript = (scores.javascript || 0) + tsScore;
-    // Python (import без скобки — иначе совпадает с Go "import (")
-    const pyKeywords = (s.match(/\b(def\s+\w+\s*\(|class\s+\w+|from\s+.*\s+import|if\s+__name__|print\s*\(|elif\s+)\b/g) || []).length +
-      (s.match(/\bimport\s+[a-zA-Z_][a-zA-Z0-9_]*\b/g) || []).length;
+    // Python (import без скобки — иначе совпадает с Go "import ("). Не считаем "import java." за Python
+    const pyImportMatches = s.match(/\bimport\s+[a-zA-Z_][a-zA-Z0-9_]*\b/g) || [];
+    const pyImportCount = pyImportMatches.filter((m) => !/import\s+java\b/.test(m)).length;
+    const pyKeywords = (s.match(/\b(def\s+\w+\s*\(|class\s+\w+|from\s+.*\s+import|if\s+__name__|print\s*\(|elif\s+)\b/g) || []).length + pyImportCount;
     // Отступы в 4 пробела считаем за Python только если уже есть явные признаки Python (иначе JS/другие тоже так форматируют)
     const pyIndent = pyKeywords >= 1 ? (s.match(/\n\s{4}\w/g) || []).length : 0;
     const pyScore = pyKeywords + pyIndent;
@@ -780,8 +803,8 @@ function App() {
         const baseCode = lastSqlCode || currentCode || '';
         setCode1(baseCode);
         setCode2('');
-        setTabs1([{ id: 'tab1-1', name: 'SQL вкладка', code: baseCode, output: '', language: language1 || 'javascript' }]);
-        setTabs2([{ id: 'tab2-1', name: 'Схемы', code: '', output: '', language: language2 || 'javascript' }]);
+        setTabs1([{ id: 'tab1-1', name: 'SQL вкладка', code: baseCode, output: '', language: language1 || 'javascript', stdin: '' }]);
+        setTabs2([{ id: 'tab2-1', name: 'Схемы', code: '', output: '', language: language2 || 'javascript', stdin: '' }]);
         setActiveTab1('tab1-1');
         setActiveTab2('tab2-1');
         codeByDialectRef.current.sql = baseCode;
@@ -821,7 +844,7 @@ function App() {
       if (savedForLang) {
         if (savedForLang.tabs1 && savedForLang.tabs1.length > 0) {
           setTabs1(savedForLang.tabs1);
-          setTabs2(savedForLang.tabs2 || [{ id: 'tab2-1', name: 'Вкладка 2', code: '', output: '', language: targetLang }]);
+          setTabs2(savedForLang.tabs2 || [{ id: 'tab2-1', name: 'Вкладка 2', code: '', output: '', language: targetLang, stdin: '' }]);
           setActiveTab1(savedForLang.activeTab1 || savedForLang.tabs1[0]?.id);
           setActiveTab2(savedForLang.activeTab2 || (savedForLang.tabs2?.[0]?.id) || 'tab2-1');
           setCode1(savedForLang.code1 || '');
@@ -838,7 +861,7 @@ function App() {
         }
       } else {
         setCode('');
-        setTabs([{ id: 'tab-1', name: 'Вкладка 1', code: '', output: '', language: targetLang }]);
+        setTabs([{ id: 'tab-1', name: 'Вкладка 1', code: '', output: '', language: targetLang, stdin: '' }]);
         setActiveTab('tab-1');
         setLanguage(targetLang);
         setSplitView(false);
@@ -1995,7 +2018,7 @@ function App() {
     }
     try {
       const result = await Promise.race([
-        ipcRenderer.invoke('execute-java', { code, stdin: javaInput }),
+        ipcRenderer.invoke('execute-java', { code, stdin: (tabs.find(t => t.id === activeTab)?.stdin ?? '') }),
         new Promise((_, reject) => setTimeout(() => reject(new Error('Таймаут выполнения (30 секунд)')), 30000))
       ]);
       
@@ -2065,7 +2088,7 @@ function App() {
     }
   };
 
-  // Работа с файлами: Открыть / Сохранить / Сохранить как
+  // Работа с файлами: Открыть — в новой вкладке, текущая не заменяется
   const handleOpenFile = async () => {
     if (!ipcRenderer) return;
     try {
@@ -2073,14 +2096,38 @@ function App() {
       if (!result || result.canceled || !result.filePath) return;
       const { filePath, content } = result;
       const fileName = getFileNameFromPath(filePath);
-      const ctx = getCurrentEditorContext();
       const text = typeof content === 'string' ? content : '';
-      ctx.setCode(text);
-      ctx.setTabs(prev => prev.map(tab =>
-        tab.id === ctx.activeTabId
-          ? { ...tab, code: text, filePath, name: fileName || tab.name, dirty: false }
-          : tab
-      ));
+      if (splitView) {
+        const newTabId = `tab1-${Date.now()}`;
+        setTabs1(prev => [...prev, {
+          id: newTabId,
+          name: fileName || 'Без имени',
+          code: text,
+          output: '',
+          language: language1,
+          filePath,
+          dirty: false,
+          stdin: ''
+        }]);
+        setActiveTab1(newTabId);
+        setCode1(text);
+        setOutput1('');
+      } else {
+        const newTabId = `tab-${Date.now()}`;
+        setTabs(prev => [...prev, {
+          id: newTabId,
+          name: fileName || 'Без имени',
+          code: text,
+          output: '',
+          language,
+          filePath,
+          dirty: false,
+          stdin: ''
+        }]);
+        setActiveTab(newTabId);
+        setCode(text);
+        setOutput('');
+      }
       addRecentFile(filePath);
     } catch (_) {}
   };
@@ -2127,14 +2174,38 @@ function App() {
       if (!result || result.canceled || !result.filePath) return;
       const { content } = result;
       const fileName = getFileNameFromPath(filePath);
-      const ctx = getCurrentEditorContext();
       const text = typeof content === 'string' ? content : '';
-      ctx.setCode(text);
-      ctx.setTabs(prev => prev.map(tab =>
-        tab.id === ctx.activeTabId
-          ? { ...tab, code: text, filePath, name: fileName || tab.name, dirty: false }
-          : tab
-      ));
+      if (splitView) {
+        const newTabId = `tab1-${Date.now()}`;
+        setTabs1(prev => [...prev, {
+          id: newTabId,
+          name: fileName || 'Без имени',
+          code: text,
+          output: '',
+          language: language1,
+          filePath,
+          dirty: false,
+          stdin: ''
+        }]);
+        setActiveTab1(newTabId);
+        setCode1(text);
+        setOutput1('');
+      } else {
+        const newTabId = `tab-${Date.now()}`;
+        setTabs(prev => [...prev, {
+          id: newTabId,
+          name: fileName || 'Без имени',
+          code: text,
+          output: '',
+          language,
+          filePath,
+          dirty: false,
+          stdin: ''
+        }]);
+        setActiveTab(newTabId);
+        setCode(text);
+        setOutput('');
+      }
       addRecentFile(filePath);
     } catch (_) {}
   };
@@ -2155,14 +2226,21 @@ function App() {
       if (!result || result.canceled || !result.filePath) return;
       const { filePath, content } = result;
       const fileName = getFileNameFromPath(filePath);
-      const ctx = getRightEditorContext();
       const text = typeof content === 'string' ? content : '';
-      ctx.setCode(text);
-      ctx.setTabs(prev => prev.map(tab =>
-        tab.id === ctx.activeTabId
-          ? { ...tab, code: text, filePath, name: fileName || tab.name, dirty: false }
-          : tab
-      ));
+      const newTabId = `tab2-${Date.now()}`;
+      setTabs2(prev => [...prev, {
+        id: newTabId,
+        name: fileName || 'Без имени',
+        code: text,
+        output: '',
+        language: language2,
+        filePath,
+        dirty: false,
+        stdin: ''
+      }]);
+      setActiveTab2(newTabId);
+      setCode2(text);
+      setOutput2('');
       addRecentFile(filePath);
     } catch (_) {}
   };
@@ -2362,7 +2440,7 @@ function App() {
           setOutput1(result.output || result.error || 'Выполнение завершено.');
         } else if (currentLang === 'java') {
           const result = await Promise.race([
-            ipcRenderer.invoke('execute-java', { code: code1, stdin: javaInput1 }),
+            ipcRenderer.invoke('execute-java', { code: code1, stdin: (tabs1.find(t => t.id === activeTab1)?.stdin ?? '') }),
             new Promise((_, reject) => setTimeout(() => reject(new Error('Таймаут выполнения (30 секунд)')), 30000))
           ]);
           if (result && typeof result === 'object') {
@@ -2467,7 +2545,7 @@ function App() {
           setOutput2(result.output || result.error || 'Выполнение завершено.');
         } else if (currentLang === 'java') {
           const result = await Promise.race([
-            ipcRenderer.invoke('execute-java', { code: code2, stdin: javaInput2 }),
+            ipcRenderer.invoke('execute-java', { code: code2, stdin: (tabs2.find(t => t.id === activeTab2)?.stdin ?? '') }),
             new Promise((_, reject) => setTimeout(() => reject(new Error('Таймаут выполнения (30 секунд)')), 30000))
           ]);
           if (result && typeof result === 'object') {
@@ -2627,6 +2705,13 @@ function App() {
     }
     
     return formatted;
+  }, []);
+
+  // По коду определяем, что это скорее всего Java (чтобы не применять к нему форматтер Python/других)
+  const looksLikeJava = useCallback((text) => {
+    if (!text || typeof text !== 'string') return false;
+    const t = text.trim();
+    return /^\s*import\s+java\./m.test(t) || /\bpublic\s+class\s+\w+/.test(t) || /\bclass\s+\w+[\s{]/.test(t);
   }, []);
 
   // Полноценное форматирование Java через google-java-format (если установлен)
@@ -2992,7 +3077,7 @@ function App() {
       if (Array.isArray(parsed) && parsed.length > 0) {
         const activeId = savedActiveTab && parsed.some(t => t.id === savedActiveTab) ? savedActiveTab : parsed[0].id;
         const activeTabObj = parsed.find(t => t.id === activeId);
-        setTabs(parsed);
+        setTabs(parsed.map(t => ({ ...t, stdin: t.stdin ?? '' })));
         setActiveTab(activeId);
         if (activeTabObj) {
           setCode(activeTabObj.code ?? '');
@@ -3147,8 +3232,8 @@ function App() {
       const t2 = raw2 ? JSON.parse(raw2) : null;
       if (Array.isArray(t1) && t1.length > 0) {
         return {
-          tabs1: t1,
-          tabs2: Array.isArray(t2) && t2.length > 0 ? t2 : [{ id: 'tab2-1', name: 'Схемы', code: '', output: '', language: 'javascript' }],
+          tabs1: t1.map(t => ({ ...t, stdin: t.stdin ?? '' })),
+          tabs2: Array.isArray(t2) && t2.length > 0 ? t2.map(t => ({ ...t, stdin: t.stdin ?? '' })) : [{ id: 'tab2-1', name: 'Схемы', code: '', output: '', language: 'javascript', stdin: '' }],
           activeTab1: localStorage.getItem('codeforge_sql_activeTab1') || t1[0]?.id || 'tab1-1',
           activeTab2: localStorage.getItem('codeforge_sql_activeTab2') || 'tab2-1'
         };
@@ -3189,7 +3274,8 @@ function App() {
         output: '',
         language: langToSave,
         filePath: null,
-        dirty: false
+        dirty: false,
+        stdin: ''
       };
       return [...withCurrentSaved, newTab];
     });
@@ -3253,7 +3339,8 @@ function App() {
         output: '',
         language: langToSave,
         filePath: null,
-        dirty: false
+        dirty: false,
+        stdin: ''
       };
       return [...withCurrentSaved, newTab];
     });
@@ -3316,7 +3403,8 @@ function App() {
         output: '',
         language: langToSave,
         filePath: null,
-        dirty: false
+        dirty: false,
+        stdin: ''
       };
       return [...withCurrentSaved, newTab];
     });
@@ -3430,7 +3518,7 @@ function App() {
     return true;
   }, []);
 
-  // Горячие клавиши
+  // Горячие клавиши (capture: true, чтобы Ctrl+Alt+L не перехватывался редактором/меню)
   useEffect(() => {
     const handleKeyDown = (e) => {
       // F8 для выполнения
@@ -3447,18 +3535,86 @@ function App() {
           executeCode();
         }
       }
-      // Ctrl+Alt+L для автоформатирования
+      // Ctrl+Alt+L: форматирование (для Java — только google-java-format; иначе встроенное)
       if (e.ctrlKey && e.altKey && (e.key.toLowerCase() === 'l' || e.key === 'L')) {
         e.preventDefault();
         e.stopPropagation();
-        formatCode();
+        const el = document.activeElement;
+        const inEditor = el?.closest?.('.cm-editor');
+        let where = 'main';
+        let currentLang = language;
+        let currentCode = code;
+        if (splitView && inEditor) {
+          if (editorViewRef1.current?.dom?.contains(el)) {
+            where = 'left';
+            currentLang = language1;
+            currentCode = code1;
+          } else if (editorViewRef2.current?.dom?.contains(el)) {
+            where = 'right';
+            currentLang = language2;
+            currentCode = code2;
+          }
+        }
+        const isJava = currentLang === 'java' || looksLikeJava(currentCode);
+        if (isJava) {
+          formatJavaWithCli(where);
+        } else {
+          if (where === 'main') formatCode();
+          else if (where === 'left') {
+            const formatted = formatCodeForLanguage(code1, language1);
+            if (formatted !== code1) setCode1(formatted);
+          } else if (where === 'right') {
+            const formatted = formatCodeForLanguage(code2, language2);
+            if (formatted !== code2) setCode2(formatted);
+          }
+        }
         return false;
       }
     };
 
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [code, language, isRunning, formatCode, executeCode]);
+    document.addEventListener('keydown', handleKeyDown, true);
+    return () => document.removeEventListener('keydown', handleKeyDown, true);
+  }, [code, code1, code2, language, language1, language2, isRunning, splitView, looksLikeJava, formatCode, formatCodeForLanguage, formatJavaWithCli, executeCode]);
+
+  // Глобальный хоткей Ctrl+Alt+L из главного процесса (Electron globalShortcut) — надёжно срабатывает на Windows
+  useEffect(() => {
+    if (!ipcRenderer) return;
+    const onTriggerFormat = () => {
+      const el = document.activeElement;
+      const inEditor = el?.closest?.('.cm-editor');
+      let where = 'main';
+      let currentLang = language;
+      let currentCode = code;
+      if (splitView && inEditor) {
+        if (editorViewRef1.current?.dom?.contains(el)) {
+          where = 'left';
+          currentLang = language1;
+          currentCode = code1;
+        } else if (editorViewRef2.current?.dom?.contains(el)) {
+          where = 'right';
+          currentLang = language2;
+          currentCode = code2;
+        }
+      }
+      const isJava = currentLang === 'java' || looksLikeJava(currentCode);
+      if (isJava) {
+        formatJavaWithCli(where);
+      } else {
+        if (where === 'main') formatCode();
+        else if (where === 'left') {
+          const formatted = formatCodeForLanguage(code1, language1);
+          if (formatted !== code1) setCode1(formatted);
+        } else if (where === 'right') {
+          const formatted = formatCodeForLanguage(code2, language2);
+          if (formatted !== code2) setCode2(formatted);
+        }
+      }
+    };
+    ipcRenderer.on('trigger-format-java', onTriggerFormat);
+    return () => {
+      ipcRenderer.removeListener('trigger-format-java', onTriggerFormat);
+    };
+  }, [ipcRenderer, splitView, language, language1, language2, code, code1, code2, looksLikeJava, formatCode, formatCodeForLanguage, formatJavaWithCli]);
 
   // Ctrl+A — для Electron: execCommand + native Selection API
   useEffect(() => {
@@ -4272,8 +4428,8 @@ function App() {
                 } else {
                   setCode1(code);
                   setCode2(code);
-                  setTabs1([{ id: 'tab1-1', name: 'Вкладка 1', code: code, output: output, language: language }]);
-                  setTabs2([{ id: 'tab2-1', name: 'Вкладка 1', code: code, output: output, language: language }]);
+                  setTabs1([{ id: 'tab1-1', name: 'Вкладка 1', code: code, output: output, language: language, stdin: '' }]);
+                  setTabs2([{ id: 'tab2-1', name: 'Вкладка 1', code: code, output: output, language: language, stdin: '' }]);
                   setLanguage1(language);
                   setLanguage2(language);
                   setActiveTab1('tab1-1');
@@ -4576,7 +4732,10 @@ function App() {
                       autoDetectTimerRef.current = setTimeout(() => {
                         if (!sqlMode) {
                           const detected = detectLanguageFromCode(str);
-                          if (detected && detected !== language1) setLanguage1(detected);
+                          if (detected && detected !== language1) {
+                            if (language1 === 'java' && looksLikeJava(str)) return;
+                            setLanguage1(detected);
+                          }
                         }
                         // SQL-диалект не переключаем по коду — только вручную (выбор в списке)
                       }, AUTO_DETECT_DEBOUNCE_MS);
@@ -4641,8 +4800,9 @@ function App() {
                       Стандартный ввод (stdin) для <code>Scanner(System.in)</code> (окно 1):
                     </div>
                     <textarea
-                      value={javaInput1}
-                      onChange={(e) => setJavaInput1(e.target.value)}
+                      ref={javaStdinRef1}
+                      value={tabs1.find(t => t.id === activeTab1)?.stdin ?? ''}
+                      onChange={(e) => setTabs1(prev => prev.map(tab => tab.id === activeTab1 ? { ...tab, stdin: e.target.value } : tab))}
                       onInput={(e) => {
                         e.target.style.height = 'auto';
                         e.target.style.height = e.target.scrollHeight + 'px';
@@ -5368,7 +5528,10 @@ function App() {
                           if (Date.now() < skipAutoDetectUntilRef.current) return;
                           autoDetectTimerRef.current = setTimeout(() => {
                             const detected = detectLanguageFromCode(str);
-                            if (detected && detected !== language2) setLanguage2(detected);
+                            if (detected && detected !== language2) {
+                              if (language2 === 'java' && looksLikeJava(str)) return;
+                              setLanguage2(detected);
+                            }
                           }, AUTO_DETECT_DEBOUNCE_MS);
                         }}
                         onCreateEditor={(view) => {
@@ -5429,8 +5592,9 @@ function App() {
                           Стандартный ввод (stdin) для <code>Scanner(System.in)</code> (окно 2):
                         </div>
                         <textarea
-                          value={javaInput2}
-                          onChange={(e) => setJavaInput2(e.target.value)}
+                          ref={javaStdinRef2}
+                          value={tabs2.find(t => t.id === activeTab2)?.stdin ?? ''}
+                          onChange={(e) => setTabs2(prev => prev.map(tab => tab.id === activeTab2 ? { ...tab, stdin: e.target.value } : tab))}
                           onInput={(e) => {
                             e.target.style.height = 'auto';
                             e.target.style.height = e.target.scrollHeight + 'px';
@@ -5675,7 +5839,10 @@ function App() {
                     if (Date.now() < skipAutoDetectUntilRef.current) return;
                     autoDetectTimerRef.current = setTimeout(() => {
                       const detected = detectLanguageFromCode(str);
-                      if (detected && detected !== language) setLanguage(detected);
+                      if (detected && detected !== language) {
+                        if (language === 'java' && looksLikeJava(str)) return;
+                        setLanguage(detected);
+                      }
                     }, AUTO_DETECT_DEBOUNCE_MS);
                   }}
                   onCreateEditor={(view) => {
@@ -5721,8 +5888,9 @@ function App() {
                     Стандартный ввод (stdin) для <code>Scanner(System.in)</code>:
                   </div>
                   <textarea
-                    value={javaInput}
-                    onChange={(e) => setJavaInput(e.target.value)}
+                    ref={javaStdinRef}
+                    value={tabs.find(t => t.id === activeTab)?.stdin ?? ''}
+                    onChange={(e) => setTabs(prev => prev.map(tab => tab.id === activeTab ? { ...tab, stdin: e.target.value } : tab))}
                     onInput={(e) => {
                       e.target.style.height = 'auto';
                       e.target.style.height = e.target.scrollHeight + 'px';
@@ -5869,10 +6037,10 @@ function App() {
                     return tab ? { ...tab, id: `tab2-${Date.now()}-${tabId}` } : null;
                   }).filter(Boolean);
                   if (tabs1Selected.length === 0) {
-                    tabs1Selected.push({ id: 'tab1-1', name: 'Вкладка 1', code: '', output: '', language: language, filePath: null, dirty: false });
+                    tabs1Selected.push({ id: 'tab1-1', name: 'Вкладка 1', code: '', output: '', language: language, filePath: null, dirty: false, stdin: '' });
                   }
                   if (tabs2Selected.length === 0) {
-                    tabs2Selected.push({ id: 'tab2-1', name: 'Вкладка 1', code: '', output: '', language: language, filePath: null, dirty: false });
+                    tabs2Selected.push({ id: 'tab2-1', name: 'Вкладка 1', code: '', output: '', language: language, filePath: null, dirty: false, stdin: '' });
                   }
                   setTabs1(tabs1Selected);
                   setTabs2(tabs2Selected);

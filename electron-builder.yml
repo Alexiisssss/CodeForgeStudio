@@ -5,6 +5,9 @@ directories:
 files:
   - build/**/*
   - package.json
+extraResources:
+  - from: tools
+    to: tools
 # CodeMirror не требует распаковки из asar
 extraMetadata:
   main: build/electron.js

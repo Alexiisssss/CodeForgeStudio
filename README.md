@@ -104,8 +104,8 @@ npm run electron-pack-win
 ## 📝 Примечания
 
 - JavaScript выполняется в браузере; **Java, Python, C++, C#, Go** — через Electron (главный процесс). В браузере без Electron эти языки не запускаются.
-- Для Java / C++ / C# / Go нужны установленные компиляторы и интерпретаторы в PATH (JDK, Python, g++/MSVC, .NET SDK, Go).
-- Для **красивого Java‑кода** поддерживается форматирование через `google-java-format` (если установлен в системе и доступен в PATH): используйте `Ctrl+Alt+L` при выбранном языке Java.
+- Для Java / C++ / C# / Go нужны установленные компиляторы и интерпретаторы в PATH (JDK, Python, g++/MSVC, .NET SDK, Go). **Для Java рекомендуется JDK 21** — с ним и запуск кода, и форматирование (google-java-format 1.29+) работают без доп. настроек. Если в системе несколько JDK и запускается не та версия (например, из-за Oracle javapath в PATH), задайте **JAVA_HOME** на нужный JDK или поставьте его `bin` в PATH выше остальных.
+- Для **красивого Java‑кода** — форматирование через `google-java-format`: положите в папку `tools/` JAR с [релизов](https://github.com/google/google-java-format/releases) и нажимайте `Ctrl+Alt+L` при выбранном Java. **Версии 1.29+ рассчитаны на JDK 21**; при JDK 24/25 задайте **`JAVA_FORMATTER_HOME`** — путь к JDK 21. При JDK 17 используйте [JAR 1.28](https://github.com/google/google-java-format/releases/tag/v1.28.0).
 - Для Java есть отдельное поле стандартного ввода (stdin): каждая введённая туда строка попадает в `Scanner(System.in)` как отдельная строка ввода.
 - Редактор построен на **CodeMirror 6** (@uiw/react-codemirror).
 
