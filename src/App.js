@@ -23,6 +23,7 @@ const { ipcRenderer } = window.require ? window.require('electron') : { ipcRende
 function App() {
   const [code, setCode] = useState('');
   const [output, setOutput] = useState('');
+  const [javaInput, setJavaInput] = useState('');
   const [language, setLanguage] = useState('javascript');
   const [language1, setLanguage1] = useState('javascript'); // Язык для окна 1 в split view
   const [language2, setLanguage2] = useState('javascript'); // Язык для окна 2 в split view
@@ -82,6 +83,8 @@ function App() {
   // Состояния для split view - независимые окна
   const [code1, setCode1] = useState('');
   const [code2, setCode2] = useState('');
+  const [javaInput1, setJavaInput1] = useState('');
+  const [javaInput2, setJavaInput2] = useState('');
   // Вкладки для каждого окна в split view
   const [tabs1, setTabs1] = useState([{ id: 'tab1-1', name: 'Вкладка 1', code: '', output: '', language: 'javascript', filePath: null, dirty: false }]);
   const [activeTab1, setActiveTab1] = useState('tab1-1');
@@ -1992,7 +1995,7 @@ function App() {
     }
     try {
       const result = await Promise.race([
-        ipcRenderer.invoke('execute-java', code),
+        ipcRenderer.invoke('execute-java', { code, stdin: javaInput }),
         new Promise((_, reject) => setTimeout(() => reject(new Error('Таймаут выполнения (30 секунд)')), 30000))
       ]);
       
@@ -2359,7 +2362,7 @@ function App() {
           setOutput1(result.output || result.error || 'Выполнение завершено.');
         } else if (currentLang === 'java') {
           const result = await Promise.race([
-            ipcRenderer.invoke('execute-java', code1),
+            ipcRenderer.invoke('execute-java', { code: code1, stdin: javaInput1 }),
             new Promise((_, reject) => setTimeout(() => reject(new Error('Таймаут выполнения (30 секунд)')), 30000))
           ]);
           if (result && typeof result === 'object') {
@@ -2464,7 +2467,7 @@ function App() {
           setOutput2(result.output || result.error || 'Выполнение завершено.');
         } else if (currentLang === 'java') {
           const result = await Promise.race([
-            ipcRenderer.invoke('execute-java', code2),
+            ipcRenderer.invoke('execute-java', { code: code2, stdin: javaInput2 }),
             new Promise((_, reject) => setTimeout(() => reject(new Error('Таймаут выполнения (30 секунд)')), 30000))
           ]);
           if (result && typeof result === 'object') {
@@ -2588,110 +2591,32 @@ function App() {
         return newIndent + cleaned;
       }).join('\n');
     } else if (lang === 'java' || lang === 'cpp' || lang === 'csharp') {
-      // Улучшенное форматирование для Java/C++/C# - исправляет отступы и пробелы
+      // Для Java/C++/C# по умолчанию — только выравнивание отступов (fallback),
+      // а полноценное форматирование Java делаем через google-java-format по Ctrl+Alt+L
       let indentLevel = 0;
-      formatted = lines.map((line, index) => {
+      formatted = lines.map((line) => {
+        const original = line;
         let trimmed = line.trim();
-        if (!trimmed) {
-          return '';
-        }
-        
-        // Удаляем эмодзи из комментариев (заменяем на пустую строку или оставляем текст)
-        if (trimmed.startsWith('//')) {
-          // Удаляем эмодзи из комментариев
-          trimmed = trimmed.replace(/[\u{1F300}-\u{1F9FF}]/gu, '').replace(/[\u{2600}-\u{26FF}]/gu, '').replace(/[\u{2700}-\u{27BF}]/gu, '');
-        }
-        
-        // Уменьшаем отступ для закрывающих скобок
-        if (trimmed.startsWith('}') || trimmed.startsWith(']') || trimmed.startsWith(')')) {
+        if (!trimmed) return '';
+
+        const openBefore = (original.match(/{/g) || []).length;
+        const closeBefore = (original.match(/}/g) || []).length;
+
+        if (trimmed.startsWith('}') || trimmed.startsWith('};')) {
           indentLevel = Math.max(0, indentLevel - 1);
         }
-        
+
         const newIndent = '    '.repeat(indentLevel);
-        
-        // Нормализуем пробелы - убираем множественные пробелы
-        trimmed = trimmed.replace(/\s+/g, ' ');
-        
-        // ВАЖНО: Сначала защищаем составные операторы от разбиения пробелами
-        // Заменяем составные операторы на временные маркеры
-        const markers = {
-          arrow: '__ARROW__',
-          doubleColon: '__DOUBLECOLON__',
-          doubleEqual: '__DOUBLEEQUAL__',
-          notEqual: '__NOTEQUAL__',
-          lessEqual: '__LESSEQUAL__',
-          greaterEqual: '__GREATEREQUAL__',
-          andAnd: '__ANDAND__',
-          orOr: '__OROR__',
-          generic: '__GENERIC__'
-        };
-        
-        // Защищаем составные операторы
-        trimmed = trimmed.replace(/->/g, markers.arrow);
-        trimmed = trimmed.replace(/::/g, markers.doubleColon);
-        trimmed = trimmed.replace(/==/g, markers.doubleEqual);
-        trimmed = trimmed.replace(/!=/g, markers.notEqual);
-        trimmed = trimmed.replace(/<=/g, markers.lessEqual);
-        trimmed = trimmed.replace(/>=/g, markers.greaterEqual);
-        trimmed = trimmed.replace(/&&/g, markers.andAnd);
-        trimmed = trimmed.replace(/\|\|/g, markers.orOr);
-        
-        // Защищаем угловые скобки дженериков (паттерн: <Type> или <Type, Type2>)
-        // Заменяем < Type > на маркер, чтобы потом восстановить без пробелов
-        // Ищем паттерны вида < Type >, <Type, Type2>, List<Type> и т.д.
-        trimmed = trimmed.replace(/<\s*([A-Za-z_][A-Za-z0-9_,\s<>]*?)\s*>/g, (match, content) => {
-          // Убираем пробелы внутри дженериков, но сохраняем запятые
-          const cleaned = content.replace(/\s+/g, '').replace(/,/g, ', ');
-          return markers.generic + cleaned + markers.generic;
-        });
-        
-        // Теперь исправляем пробелы вокруг операторов (но не внутри защищенных)
-        trimmed = trimmed.replace(/\s*=\s*/g, ' = ');
-        trimmed = trimmed.replace(/\s*,\s*/g, ', ');
-        trimmed = trimmed.replace(/\s*;\s*/g, '; ');
-        trimmed = trimmed.replace(/\s*:\s*/g, ': ');
-        
-        // Исправляем пробелы вокруг скобок (но не внутри угловых скобок дженериков)
-        trimmed = trimmed.replace(/\s*{\s*/g, ' { ');
-        trimmed = trimmed.replace(/\s*}\s*/g, ' } ');
-        trimmed = trimmed.replace(/\s*\(\s*/g, ' ( ');
-        trimmed = trimmed.replace(/\s*\)\s*/g, ' ) ');
-        trimmed = trimmed.replace(/\s*\[\s*/g, ' [ ');
-        trimmed = trimmed.replace(/\s*\]\s*/g, ' ] ');
-        
-        // Убираем лишние пробелы
-        trimmed = trimmed.replace(/  +/g, ' ').trim();
-        
-        // Исправляем пробелы перед открывающими скобками после ключевых слов
-        trimmed = trimmed.replace(/\s+{/g, ' {');
-        trimmed = trimmed.replace(/}\s+/g, '} ');
-        trimmed = trimmed.replace(/\s+\(/g, ' (');
-        trimmed = trimmed.replace(/\)\s+/g, ') ');
-        trimmed = trimmed.replace(/\s+\[/g, ' [');
-        trimmed = trimmed.replace(/\]\s+/g, '] ');
-        trimmed = trimmed.replace(/\s+;/g, ';');
-        
-        // Восстанавливаем угловые скобки дженериков (заменяем маркеры обратно на < и >)
-        trimmed = trimmed.replace(new RegExp(markers.generic + '([A-Za-z0-9_,]+)' + markers.generic, 'g'), '<$1>');
-        
-        // Восстанавливаем составные операторы
-        trimmed = trimmed.replace(new RegExp(markers.arrow, 'g'), '->');
-        trimmed = trimmed.replace(new RegExp(markers.doubleColon, 'g'), '::');
-        trimmed = trimmed.replace(new RegExp(markers.doubleEqual, 'g'), '==');
-        trimmed = trimmed.replace(new RegExp(markers.notEqual, 'g'), '!=');
-        trimmed = trimmed.replace(new RegExp(markers.lessEqual, 'g'), '<=');
-        trimmed = trimmed.replace(new RegExp(markers.greaterEqual, 'g'), '>=');
-        trimmed = trimmed.replace(new RegExp(markers.andAnd, 'g'), '&&');
-        trimmed = trimmed.replace(new RegExp(markers.orOr, 'g'), '||');
-        
-        // Увеличиваем отступ для открывающих скобок
-        if (trimmed.endsWith('{') || trimmed.endsWith('[') || trimmed.endsWith('(')) {
+
+        if (trimmed.endsWith('{') || trimmed.endsWith('{;') || /{\s*$/.test(trimmed)) {
           indentLevel++;
+        } else {
+          indentLevel += openBefore - closeBefore;
+          if (indentLevel < 0) indentLevel = 0;
         }
-        
+
         return newIndent + trimmed;
       }).join('\n');
-      formatted = formatted.replace(/\n\n\n+/g, '\n\n');
     } else {
       formatted = lines.map(line => {
         const trimmed = line.trim();
@@ -2703,6 +2628,72 @@ function App() {
     
     return formatted;
   }, []);
+
+  // Полноценное форматирование Java через google-java-format (если установлен)
+  const formatJavaWithCli = useCallback(async (where) => {
+    if (!ipcRenderer) return;
+    let currentCode = '';
+    let setCodeFn = null;
+    let updateTabs = null;
+
+    if (where === 'main') {
+      currentCode = code;
+      setCodeFn = setCode;
+      updateTabs = (newCode) => {
+        setTabs(prev => prev.map(tab =>
+          tab.id === activeTab ? { ...tab, code: newCode, dirty: true } : tab
+        ));
+      };
+    } else if (where === 'left') {
+      currentCode = code1;
+      setCodeFn = setCode1;
+      updateTabs = (newCode) => {
+        setTabs1(prev => prev.map(tab =>
+          tab.id === activeTab1 ? { ...tab, code: newCode, dirty: true } : tab
+        ));
+      };
+    } else if (where === 'right') {
+      currentCode = code2;
+      setCodeFn = setCode2;
+      updateTabs = (newCode) => {
+        setTabs2(prev => prev.map(tab =>
+          tab.id === activeTab2 ? { ...tab, code: newCode, dirty: true } : tab
+        ));
+      };
+    }
+
+    if (!currentCode || !currentCode.trim() || !setCodeFn || !updateTabs) return;
+
+    try {
+      const result = await ipcRenderer.invoke('format-java', currentCode);
+      if (result && result.formatted && typeof result.formatted === 'string') {
+        const formatted = result.formatted;
+        if (formatted !== currentCode) {
+          setCodeFn(formatted);
+          updateTabs(formatted);
+        }
+      } else if (result && result.error) {
+        // Мягко выводим ошибку в вывод соответствующего окна
+        const msg = `Форматирование Java через google-java-format недоступно:\n${result.error}`;
+        if (where === 'main') {
+          setOutput(msg);
+        } else if (where === 'left') {
+          setOutput1(msg);
+        } else if (where === 'right') {
+          setOutput2(msg);
+        }
+      }
+    } catch (e) {
+      const msg = `Ошибка форматирования Java через google-java-format: ${e.message || e}`;
+      if (where === 'main') {
+        setOutput(msg);
+      } else if (where === 'left') {
+        setOutput1(msg);
+      } else if (where === 'right') {
+        setOutput2(msg);
+      }
+    }
+  }, [ipcRenderer, code, code1, code2, activeTab, activeTab1, activeTab2, setCode, setCode1, setCode2, setTabs, setTabs1, setTabs2, setOutput, setOutput1, setOutput2]);
 
   // Функция автоформатирования кода (классическое форматирование)
   const formatCode = useCallback(() => {
@@ -4525,6 +4516,10 @@ function App() {
                         {
                           key: 'Ctrl-Alt-l',
                           run: () => {
+                            if (language1 === 'java') {
+                              formatJavaWithCli('left');
+                              return true;
+                            }
                             const formatted = formatCodeForLanguage(code1, language1);
                             if (formatted !== code1) {
                               setCode1(formatted);
@@ -4617,16 +4612,58 @@ function App() {
                     <span className="output-title">
                       {sqlMode ? 'Результат выполнения' : 'Результат выполнения (1)'}
                     </span>
-                    <button 
-                      className="btn btn-secondary"
-                      onClick={clearOutput1}
-                      style={{ padding: '2px 8px', fontSize: '11px' }}
-                      title="Очистить вывод"
-                    >
-                      🧹
-                    </button>
+                    <div style={{ display: 'flex', gap: '6px' }}>
+                      {!sqlMode && (
+                        <button 
+                          className="btn btn-primary"
+                          onClick={executeCode1}
+                          disabled={isRunning1}
+                          style={{ padding: '2px 8px', fontSize: '11px' }}
+                          title="Выполнить код (окно 1)"
+                        >
+                          ▶️ Выполнить
+                        </button>
+                      )}
+                      <button 
+                        className="btn btn-secondary"
+                        onClick={clearOutput1}
+                        style={{ padding: '2px 8px', fontSize: '11px' }}
+                        title="Очистить вывод"
+                      >
+                        🧹
+                      </button>
+                    </div>
                   </div>
                 </div>
+                {language1 === 'java' && !sqlMode && (
+                  <div style={{ padding: '6px 8px', borderBottom: '1px solid #3e3e3e', background: '#252526' }}>
+                    <div style={{ fontSize: '11px', color: '#9b9b9b', marginBottom: '4px' }}>
+                      Стандартный ввод (stdin) для <code>Scanner(System.in)</code> (окно 1):
+                    </div>
+                    <textarea
+                      value={javaInput1}
+                      onChange={(e) => setJavaInput1(e.target.value)}
+                      onInput={(e) => {
+                        e.target.style.height = 'auto';
+                        e.target.style.height = e.target.scrollHeight + 'px';
+                      }}
+                      rows={3}
+                      style={{
+                        width: '100%',
+                        resize: 'none',
+                        overflow: 'hidden',
+                        fontFamily: fontFamily,
+                        fontSize: `${fontSize}px`,
+                        background: '#1e1e1e',
+                        color: fontColor,
+                        border: '1px solid #3e3e3e',
+                        borderRadius: 4,
+                        padding: '4px 6px'
+                      }}
+                      placeholder="Строки для Scanner(System.in) в левом окне..."
+                    />
+                  </div>
+                )}
                 <div className="output-content">
                   <pre 
                     className="output-text"
@@ -5281,6 +5318,10 @@ function App() {
                             {
                               key: 'Ctrl-Alt-l',
                               run: () => {
+                                if (language2 === 'java') {
+                                  formatJavaWithCli('right');
+                                  return true;
+                                }
                                 const formatted = formatCodeForLanguage(code2, language2);
                                 if (formatted !== code2) {
                                   setCode2(formatted);
@@ -5359,14 +5400,18 @@ function App() {
                     <div className="output-header">
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%' }}>
                         <span className="output-title">Результат выполнения (2)</span>
-                        <div style={{ display: 'flex', gap: '8px' }}>
-                          {/* <button 
-                            className="btn btn-secondary"
-                            onClick={clearCode2}
-                            style={{ padding: '2px 8px', fontSize: '11px' }}
-                            title="Очистить код"
-                          >
-                          </button> */}
+                        <div style={{ display: 'flex', gap: '6px' }}>
+                          {!sqlMode && (
+                            <button 
+                              className="btn btn-primary"
+                              onClick={executeCode2}
+                              disabled={isRunning2}
+                              style={{ padding: '2px 8px', fontSize: '11px' }}
+                              title="Выполнить код (окно 2)"
+                            >
+                              ▶️ Выполнить
+                            </button>
+                          )}
                           <button 
                             className="btn btn-secondary"
                             onClick={clearOutput2}
@@ -5378,17 +5423,46 @@ function App() {
                         </div>
                       </div>
                     </div>
+                    {language2 === 'java' && !sqlMode && (
+                      <div style={{ padding: '6px 8px', borderBottom: '1px solid #3e3e3e', background: '#252526' }}>
+                        <div style={{ fontSize: '11px', color: '#9b9b9b', marginBottom: '4px' }}>
+                          Стандартный ввод (stdin) для <code>Scanner(System.in)</code> (окно 2):
+                        </div>
+                        <textarea
+                          value={javaInput2}
+                          onChange={(e) => setJavaInput2(e.target.value)}
+                          onInput={(e) => {
+                            e.target.style.height = 'auto';
+                            e.target.style.height = e.target.scrollHeight + 'px';
+                          }}
+                          rows={3}
+                          style={{
+                            width: '100%',
+                            resize: 'none',
+                            overflow: 'hidden',
+                            fontFamily: fontFamily,
+                            fontSize: `${fontSize}px`,
+                            background: '#1e1e1e',
+                            color: fontColor,
+                            border: '1px solid #3e3e3e',
+                            borderRadius: 4,
+                            padding: '4px 6px'
+                          }}
+                          placeholder="Строки для Scanner(System.in) в правом окне..."
+                        />
+                      </div>
+                    )}
                     <div className="output-content">
                       <pre 
                         className="output-text"
                         style={{
-                      fontFamily: fontFamily,
-                      fontSize: `${fontSize}px`,
-                      fontStyle: fontStyle,
-                      color: output2 ? fontColor : '#6a6a6a'
-                    }}
-                  >
-                    {output2 || 'Вывод появится здесь после выполнения кода...'}
+                          fontFamily: fontFamily,
+                          fontSize: `${fontSize}px`,
+                          fontStyle: fontStyle,
+                          color: output2 ? fontColor : '#6a6a6a'
+                        }}
+                      >
+                        {output2 || 'Вывод появится здесь после выполнения кода...'}
                       </pre>
                     </div>
                   </div>
@@ -5551,6 +5625,10 @@ function App() {
                       {
                         key: 'Ctrl-Alt-l',
                         run: () => {
+                          if (language === 'java') {
+                            formatJavaWithCli('main');
+                            return true;
+                          }
                           const formatted = formatCodeForLanguage(code, language);
                           if (formatted !== code) {
                             setCode(formatted);
@@ -5625,8 +5703,47 @@ function App() {
             />
             <div className="output-container" style={{ width: `${outputWidth}px` }}>
               <div className="output-header">
-                <span className="output-title">Результат выполнения</span>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%' }}>
+                  <span className="output-title">Результат выполнения</span>
+                  <button 
+                    className="btn btn-secondary"
+                    onClick={clearOutput}
+                    style={{ padding: '2px 8px', fontSize: '11px' }}
+                    title="Очистить вывод"
+                  >
+                    🧹
+                  </button>
+                </div>
               </div>
+              {language === 'java' && (
+                <div style={{ padding: '6px 8px', borderBottom: '1px solid #3e3e3e', background: '#252526' }}>
+                  <div style={{ fontSize: '11px', color: '#9b9b9b', marginBottom: '4px' }}>
+                    Стандартный ввод (stdin) для <code>Scanner(System.in)</code>:
+                  </div>
+                  <textarea
+                    value={javaInput}
+                    onChange={(e) => setJavaInput(e.target.value)}
+                    onInput={(e) => {
+                      e.target.style.height = 'auto';
+                      e.target.style.height = e.target.scrollHeight + 'px';
+                    }}
+                    rows={3}
+                    style={{
+                      width: '100%',
+                      resize: 'none',
+                      overflow: 'hidden',
+                      fontFamily: fontFamily,
+                      fontSize: `${fontSize}px`,
+                      background: '#1e1e1e',
+                      color: fontColor,
+                      border: '1px solid #3e3e3e',
+                      borderRadius: 4,
+                      padding: '4px 6px'
+                    }}
+                    placeholder="Каждая строка здесь будет подана в Scanner(System.in) как отдельная строка..."
+                  />
+                </div>
+              )}
               <div className="output-content">
                 <pre 
                   className="output-text"

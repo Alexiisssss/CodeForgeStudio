@@ -1,4 +1,4 @@
-# CodeForge Studio — A modern code notebook in two modes (programming language + SQL)
+ # CodeForge Studio — A modern code notebook in two modes (programming language + SQL)
 
 **English** | **[Русский](README.md)**
 
@@ -86,8 +86,8 @@ In **Split view**, the right pane has its own **Open / Save / Save As** for the 
 
 - JavaScript (runs in browser)
 - TypeScript, Python, Java, Go, C++, C#
-- HTML, CSS
-- Plain text (no syntax highlighting)
++- HTML, CSS
++- Plain text (no syntax highlighting)
 
 ## ⌨️ Shortcuts
 
@@ -105,6 +105,8 @@ In **Split view**, the right pane has its own **Open / Save / Save As** for the 
 
 - JavaScript runs in the browser; **Java, Python, C++, C#, Go** run via Electron (main process). They do not run in the browser without Electron.
 - For Java / C++ / C# / Go you need the corresponding compilers/interpreters in PATH (JDK, Python, g++/MSVC, .NET SDK, Go).
+- For **clean Java code**, you can use `google-java-format` (if installed and available in PATH): press `Ctrl+Alt+L` when the language is Java.
+- There is a dedicated stdin field for Java: everything you type there is passed to `Scanner(System.in)` as standard input lines.
 - The editor is built on **CodeMirror 6** (@uiw/react-codemirror).
 
 ## 🎨 Interface

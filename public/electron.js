@@ -326,6 +326,78 @@ ipcMain.handle('file-open-path', async (event, filePath) => {
   }
 });
 
+// Форматирование Java-кода через google-java-format (если установлен в системе)
+ipcMain.handle('format-java', async (event, code) => {
+  return new Promise((resolve) => {
+    if (!code || typeof code !== 'string' || !code.trim()) {
+      resolve({ formatted: code || '' });
+      return;
+    }
+
+    let formatter;
+    try {
+      // Ожидаем, что google-java-format доступен в PATH
+      formatter = spawn('google-java-format', ['-'], {
+        shell: true,
+        encoding: 'utf8'
+      });
+    } catch (e) {
+      writeLog('ERROR', `Не удалось запустить google-java-format: ${e.message}`, e);
+      resolve({
+        error: 'google-java-format не найден. Установите его и добавьте в PATH.\nПодробнее: https://github.com/google/google-java-format'
+      });
+      return;
+    }
+
+    let output = '';
+    let error = '';
+
+    formatter.stdout.on('data', (data) => {
+      try {
+        output += data.toString('utf8');
+      } catch (_) {
+        output += String(data);
+      }
+    });
+
+    formatter.stderr.on('data', (data) => {
+      try {
+        error += data.toString('utf8');
+      } catch (_) {
+        error += String(data);
+      }
+    });
+
+    formatter.on('error', (err) => {
+      writeLog('ERROR', `Ошибка запуска google-java-format: ${err.message}`, err);
+      resolve({
+        error: 'Не удалось запустить google-java-format. Проверьте, что он установлен и доступен в PATH.'
+      });
+    });
+
+    formatter.on('close', (exitCode) => {
+      if (exitCode === 0 && output) {
+        resolve({ formatted: output });
+      } else {
+        const msg = error || `google-java-format завершился с кодом ${exitCode}`;
+        resolve({
+          error: `Ошибка форматирования Java-кода через google-java-format:\n${msg}`
+        });
+      }
+    });
+
+    try {
+      formatter.stdin.write(code);
+      formatter.stdin.end();
+    } catch (e) {
+      writeLog('ERROR', `Ошибка записи кода в google-java-format: ${e.message}`, e);
+      resolve({
+        error: 'Не удалось передать код в google-java-format.'
+      });
+    }
+  });
+});
+
 // IPC обработчики для выполнения кода
 const tempDir = path.join(os.tmpdir(), 'modern-notepad');
 
@@ -389,7 +461,7 @@ ipcMain.handle('execute-python', async (event, code) => {
 });
 
 // Выполнение Java
-ipcMain.handle('execute-java', async (event, code) => {
+ipcMain.handle('execute-java', async (event, payload) => {
   return new Promise((resolve, reject) => {
     // Добавляем общий обработчик ошибок для гарантии разрешения Promise
     const safeResolve = (result) => {
@@ -413,6 +485,8 @@ ipcMain.handle('execute-java', async (event, code) => {
     });
     
     try {
+      const code = typeof payload === 'string' ? payload : (payload && typeof payload.code === 'string' ? payload.code : '');
+      const stdinData = payload && typeof payload.stdin === 'string' ? payload.stdin : '';
       // Проверяем наличие package в коде
       const packageMatch = code.match(/package\s+([\w.]+)\s*;/);
       const packageName = packageMatch ? packageMatch[1] : null;
@@ -760,6 +834,17 @@ ipcMain.handle('execute-java', async (event, code) => {
           shell: false,
           cwd: classDirAbsolute
         });
+        // Передаем данные во stdin (для Scanner(System.in)) и закрываем поток
+        try {
+          if (java.stdin) {
+            if (stdinData && stdinData.length > 0) {
+              java.stdin.write(stdinData);
+            }
+            java.stdin.end();
+          }
+        } catch (e) {
+          // игнорируем ошибки при работе со stdin
+        }
         let output = '';
         let error = '';
         
