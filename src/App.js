@@ -99,7 +99,35 @@ function App() {
   const [isResizingVertical2, setIsResizingVertical2] = useState(false);
   const [isResizingSplit, setIsResizingSplit] = useState(false);
   const [splitPaneWidth, setSplitPaneWidth] = useState(50); // Процент ширины первого окна
-  
+
+  // AI Assistant: перетаскиваемое окно (Ollama — бесплатно, локально)
+  const [showAiPanel, setShowAiPanel] = useState(false);
+  const [ollamaModel, setOllamaModel] = useState(() => {
+    try { return localStorage.getItem('codeforge_ollama_model') || 'llama3.2'; } catch (_) { return 'llama3.2'; }
+  });
+  const [aiMessagesByTab, setAiMessagesByTab] = useState({}); // Чат отдельно для каждой вкладки
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiInput, setAiInput] = useState('');
+  const aiChatKey = splitView ? activeTab1 : activeTab;
+  const aiMessages = aiMessagesByTab[aiChatKey] || [];
+  const [aiPanelLeft, setAiPanelLeft] = useState(80);
+  const [aiPanelTop, setAiPanelTop] = useState(80);
+  const [aiPanelWidth, setAiPanelWidth] = useState(() => {
+    try { const w = parseInt(localStorage.getItem('codeforge_ai_panel_width'), 10); return (w >= 400 && w <= 1200) ? w : 560; } catch (_) { return 560; }
+  });
+  const [aiPanelHeight, setAiPanelHeight] = useState(() => {
+    try { const h = parseInt(localStorage.getItem('codeforge_ai_panel_height'), 10); return (h >= 380 && h <= 900) ? h : 520; } catch (_) { return 520; }
+  });
+  const [isDraggingAiPanel, setIsDraggingAiPanel] = useState(false);
+  const [isResizingAiPanel, setIsResizingAiPanel] = useState(false);
+  const aiPanelDragRef = useRef({ startX: 0, startY: 0, startLeft: 0, startTop: 0 });
+  const aiPanelResizeRef = useRef({ startX: 0, startY: 0, startWidth: 0, startHeight: 0 });
+  const aiInputRef = useRef(null);
+  const AI_PANEL_MIN_WIDTH = 380;
+  const AI_PANEL_MIN_HEIGHT = 320;
+  const [ollamaDownloadProgress, setOllamaDownloadProgress] = useState(null);
+  const [ollamaDownloadDone, setOllamaDownloadDone] = useState(null);
+
   // Настройки шрифта
   const [fontFamily, setFontFamily] = useState('Consolas');
   const [fontSize, setFontSize] = useState(14);
@@ -625,6 +653,9 @@ function App() {
     return relations;
   };
 
+  // Максимум строк для отображения в блоке «Данные таблицы» (чтобы не тормозить при 1M+ записей)
+  const SQL_TABLE_VIEW_MAX_ROWS = 10000;
+
   // Загрузка содержимого таблицы по кнопке справа (SELECT * FROM table_name)
   const loadTableData = useCallback(async (tableName) => {
     setSqlTableDataView({ tableName, columns: [], rows: [], loading: true });
@@ -632,29 +663,38 @@ function App() {
       if (sqlDialect === 'sql') {
         const db = await getOrCreateSqlDb();
         const escaped = `"${String(tableName).replace(/"/g, '""')}"`;
-        const result = db.exec(`SELECT * FROM ${escaped}`);
+        // Сначала считаем количество строк (отдельный запрос — быстрый)
+        let totalRows = 0;
+        try {
+          const countResult = db.exec(`SELECT COUNT(*) FROM ${escaped}`);
+          if (countResult.length > 0 && countResult[0].values?.[0]?.[0] != null) {
+            totalRows = Number(countResult[0].values[0][0]) || 0;
+          }
+        } catch (_) {}
+        const result = db.exec(`SELECT * FROM ${escaped} LIMIT ${SQL_TABLE_VIEW_MAX_ROWS}`);
         if (result.length > 0 && result[0].columns) {
           const columns = result[0].columns;
           const rows = result[0].values ?? [];
-          setSqlTableDataView({ tableName, columns, rows });
+          setSqlTableDataView({ tableName, columns, rows, totalRows: totalRows || rows.length, loading: false });
         } else {
-          setSqlTableDataView({ tableName, columns: [], rows: [] });
+          setSqlTableDataView({ tableName, columns: [], rows: [], totalRows: 0, loading: false });
         }
       } else if (sqlDialect === 'postgres' && ipcRenderer) {
-        const result = await ipcRenderer.invoke('execute-postgres', { connection: postgresConn, query: `SELECT * FROM "${String(tableName).replace(/"/g, '""')}"` }).catch((e) => ({ error: e.message }));
+        const result = await ipcRenderer.invoke('execute-postgres', { connection: postgresConn, query: `SELECT * FROM "${String(tableName).replace(/"/g, '""')}" LIMIT ${SQL_TABLE_VIEW_MAX_ROWS}` }).catch((e) => ({ error: e.message }));
         if (result.error) return;
         const columns = result.columns ?? [];
         const rows = result.rows ?? [];
-        setSqlTableDataView({ tableName, columns, rows });
+        setSqlTableDataView({ tableName, columns, rows, totalRows: rows.length, loading: false });
       } else if (sqlDialect === 'oracle' && ipcRenderer) {
-        const result = await ipcRenderer.invoke('execute-oracle', { connection: oracleConn, query: `SELECT * FROM "${String(tableName).replace(/"/g, '""')}"` }).catch((e) => ({ error: e.message }));
+        const result = await ipcRenderer.invoke('execute-oracle', { connection: oracleConn, query: `SELECT * FROM "${String(tableName).replace(/"/g, '""')}" FETCH FIRST ${SQL_TABLE_VIEW_MAX_ROWS} ROWS ONLY` }).catch((e) => ({ error: e.message }));
         if (result.error) return;
         const columns = result.columns ?? [];
         const rows = result.rows ?? [];
-        setSqlTableDataView({ tableName, columns, rows });
+        setSqlTableDataView({ tableName, columns, rows, totalRows: rows.length, loading: false });
       }
     } catch (err) {
       console.warn('loadTableData:', err);
+      setSqlTableDataView((prev) => prev ? { ...prev, loading: false } : null);
     }
   }, [sqlDialect, getOrCreateSqlDb, postgresConn, oracleConn, ipcRenderer]);
 
@@ -2345,16 +2385,14 @@ function App() {
               ? '\n\nПодсказка: одна БД общая для всех вкладок. Сначала выполните скрипт с CREATE TABLE (во вкладке 1), затем SELECT можно делать в любой вкладке.'
               : '';
             setOutput1(errMsg + hint);
-            // Справа обновляем таблицы при любом CREATE/DROP TABLE (в т.ч. после DROP — список может стать пустым)
-            const hasCreateOrDrop = /CREATE\s+TABLE|DROP\s+TABLE/i.test(codeToParse);
-            if (hasCreateOrDrop && tables != null) {
+            // Справа всегда обновляем список таблиц после любого выполнения (CREATE/DROP/INSERT/UPDATE/DELETE)
+            if (tables != null && tables.length >= 0) {
               setSqlTables(tables);
               setErdPositions(prev => {
                 const next = { ...prev };
                 tables.forEach((t, idx) => {
                   if (!next[t.name]) next[t.name] = { x: 50 + (idx % 3) * 320, y: 50 + Math.floor(idx / 3) * 250 };
                 });
-                // Убираем позиции для таблиц, которых больше нет
                 Object.keys(next).forEach(name => {
                   if (!tables.some(t => t.name === name)) delete next[name];
                 });
@@ -2364,9 +2402,9 @@ function App() {
                 setSqlTableDataView(null);
               }
             }
-            // После INSERT/UPDATE/DELETE обновляем вид «Данные таблицы», если он открыт
+            // После INSERT/UPDATE/DELETE ждём обновления вида «Данные таблицы», чтобы не показывало «нет строк»
             if (!error && sqlTableDataView?.tableName) {
-              loadTableData(sqlTableDataView.tableName);
+              await loadTableData(sqlTableDataView.tableName);
             }
           } catch (loadErr) {
             setOutput1('Для выполнения SQL установите sql.js: npm install sql.js\nПосле установки скопируйте public/sql-wasm.wasm (или перезапустите npm install).\nОшибка: ' + loadErr.message);
@@ -3130,21 +3168,26 @@ function App() {
       if (savedDialect === 'postgres' || savedDialect === 'oracle' || savedDialect === 'sql') {
         setSqlDialect(savedDialect);
       }
+      const savedOllamaModel = localStorage.getItem('codeforge_ollama_model');
+      if (typeof savedOllamaModel === 'string' && savedOllamaModel.trim()) {
+        setOllamaModel(savedOllamaModel.trim());
+      }
     } catch (e) {
       console.warn('Не удалось загрузить подключения SQL:', e);
     }
   }, []);
 
-  // Сохранение подключений Postgres/Oracle и диалекта SQL при изменении (чтобы восстанавливать после перезапуска)
+  // Сохранение подключений Postgres/Oracle, диалекта SQL, модели Ollama при изменении
   useEffect(() => {
     try {
       localStorage.setItem('codeforge_postgres_conn', JSON.stringify(postgresConn));
       localStorage.setItem('codeforge_oracle_conn', JSON.stringify(oracleConn));
       localStorage.setItem('codeforge_sql_dialect', sqlDialect);
+      localStorage.setItem('codeforge_ollama_model', ollamaModel);
     } catch (e) {
-      console.warn('Не удалось сохранить подключения SQL:', e);
+      console.warn('Не удалось сохранить настройки:', e);
     }
-  }, [postgresConn, oracleConn, sqlDialect]);
+  }, [postgresConn, oracleConn, sqlDialect, ollamaModel]);
 
   // Сохранение вкладок (языки) в localStorage при изменениях и при закрытии
   useEffect(() => {
@@ -3616,6 +3659,22 @@ function App() {
     };
   }, [ipcRenderer, splitView, language, language1, language2, code, code1, code2, looksLikeJava, formatCode, formatCodeForLanguage, formatJavaWithCli]);
 
+  // События прогресса загрузки Ollama (Electron)
+  useEffect(() => {
+    if (!ipcRenderer) return;
+    const onProgress = (e, data) => setOllamaDownloadProgress(data);
+    const onDone = (e, data) => {
+      setOllamaDownloadProgress(null);
+      setOllamaDownloadDone(data);
+    };
+    ipcRenderer.on('ollama-download-progress', onProgress);
+    ipcRenderer.on('ollama-download-done', onDone);
+    return () => {
+      ipcRenderer.removeListener('ollama-download-progress', onProgress);
+      ipcRenderer.removeListener('ollama-download-done', onDone);
+    };
+  }, [ipcRenderer]);
+
   // Ctrl+A — для Electron: execCommand + native Selection API
   useEffect(() => {
     const handleKeyDown = (e) => {
@@ -3886,6 +3945,125 @@ function App() {
     setOutput1('');
   };
 
+  // Получить код из редактора (весь документ или выделение) для контекста AI — в зависимости от режима (1 или 2 окна)
+  const getEditorContextForAi = useCallback(() => {
+    try {
+      const view = splitView ? editorViewRef1.current : editorViewRef.current;
+      if (!view?.state) return '';
+      const state = view.state;
+      const sel = state.selection.main;
+      if (sel.from !== sel.to) {
+        return state.sliceDoc(sel.from, sel.to);
+      }
+      return state.sliceDoc(0, state.doc.length);
+    } catch (e) {
+      console.warn('getEditorContextForAi:', e);
+      return '';
+    }
+  }, [splitView]);
+
+  // Отправка сообщения в Ollama с контекстом кода и вкладки
+  const sendAiMessage = useCallback(async (userText) => {
+    const codeContext = getEditorContextForAi();
+    const tabName = splitView
+      ? (tabs1.find(t => t.id === activeTab1)?.name ?? 'Вкладка')
+      : (tabs.find(t => t.id === activeTab)?.name ?? 'Вкладка');
+    const contextBlock = codeContext
+      ? `Контекст: код из вкладки «${tabName}».\n\`\`\`\n${codeContext}\n\`\`\`\n\nВопрос пользователя: `
+      : `Контекст: текущая вкладка «${tabName}». (Кода в редакторе нет или не выбран.)\n\nВопрос пользователя: `;
+    const userMessageWithContext = contextBlock + userText;
+
+    const messagesForApi = [
+      { role: 'system', content: 'Ты помощник программиста. Отвечай на русском. Пользователь задаёт вопросы по коду; контекст содержит код из конкретной вкладки редактора (имя вкладки указано). Отвечай кратко, по делу. Номера строк указывай, если уместно.' },
+      ...aiMessages.map(m => ({ role: m.role, content: m.content })),
+      { role: 'user', content: userMessageWithContext }
+    ];
+
+    setAiMessagesByTab(prev => ({ ...prev, [aiChatKey]: [...(prev[aiChatKey] || []), { role: 'user', content: userText }] }));
+    setAiLoading(true);
+    setAiInput('');
+
+    try {
+      const res = await fetch('http://localhost:11434/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: (ollamaModel || 'llama3.2').trim() || 'llama3.2',
+          messages: messagesForApi,
+          stream: false
+        })
+      });
+      if (!res.ok) {
+        const errText = await res.text();
+        if (res.status === 404 || (errText && errText.toLowerCase().includes('not found'))) {
+          throw new Error(`Модель «${ollamaModel || 'llama3.2'}» не найдена. Установите Ollama с ollama.com и выполните в терминале: ollama run ${ollamaModel || 'llama3.2'}`);
+        }
+        if (res.status === 0 || res.status === 502 || res.status === 503) {
+          throw new Error('Ollama не запущена. Установите с ollama.com, затем в терминале: ollama run llama3.2');
+        }
+        throw new Error(errText.length > 150 ? errText.slice(0, 150) + '…' : errText);
+      }
+      const data = await res.json();
+      const content = data.message?.content ?? data.response ?? 'Нет ответа.';
+      setAiMessagesByTab(prev => ({ ...prev, [aiChatKey]: [...(prev[aiChatKey] || []), { role: 'assistant', content }] }));
+    } catch (err) {
+      const msg = err.message || String(err);
+      setAiMessagesByTab(prev => ({ ...prev, [aiChatKey]: [...(prev[aiChatKey] || []), { role: 'assistant', content: msg.startsWith('Ошибка') ? msg : (msg.includes('Failed to fetch') || msg.includes('NetworkError') ? 'Ollama не запущена или недоступна. Установите с ollama.com и выполните: ollama run ' + (ollamaModel || 'llama3.2') : 'Ошибка: ' + msg) }] }));
+    } finally {
+      setAiLoading(false);
+    }
+  }, [ollamaModel, aiMessages, aiChatKey, getEditorContextForAi, splitView, tabs1, activeTab1, tabs, activeTab]);
+
+  // Перетаскивание окна AI-ассистента
+  useEffect(() => {
+    if (!isDraggingAiPanel) return;
+    const onMove = (e) => {
+      const dx = e.clientX - aiPanelDragRef.current.startX;
+      const dy = e.clientY - aiPanelDragRef.current.startY;
+      setAiPanelLeft(aiPanelDragRef.current.startLeft + dx);
+      setAiPanelTop(aiPanelDragRef.current.startTop + dy);
+    };
+    const onUp = () => setIsDraggingAiPanel(false);
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+  }, [isDraggingAiPanel]);
+
+  // Изменение размера окна AI за правый нижний угол
+  useEffect(() => {
+    if (!isResizingAiPanel) return;
+    const onMove = (e) => {
+      const dx = e.clientX - aiPanelResizeRef.current.startX;
+      const dy = e.clientY - aiPanelResizeRef.current.startY;
+      setAiPanelWidth(Math.max(AI_PANEL_MIN_WIDTH, aiPanelResizeRef.current.startWidth + dx));
+      setAiPanelHeight(Math.max(AI_PANEL_MIN_HEIGHT, aiPanelResizeRef.current.startHeight + dy));
+    };
+    const onUp = () => setIsResizingAiPanel(false);
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+  }, [isResizingAiPanel]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('codeforge_ai_panel_width', String(aiPanelWidth));
+      localStorage.setItem('codeforge_ai_panel_height', String(aiPanelHeight));
+    } catch (_) {}
+  }, [aiPanelWidth, aiPanelHeight]);
+
+  useEffect(() => {
+    if (aiInput === '' && aiInputRef.current) {
+      aiInputRef.current.style.height = 'auto';
+      aiInputRef.current.style.height = '36px';
+    }
+  }, [aiInput]);
+
   const clearCode2 = () => {
     if (window.confirm('Точно удалить весь код в правом окне?')) {
       setCode2('');
@@ -4075,6 +4253,29 @@ function App() {
                         ))}
                       </div>
                     )}
+                  </div>
+                  <div className="setting-group" style={{ marginBottom: '8px' }}>
+                    <label>AI-ассистент (Ollama):</label>
+                    <label style={{ fontSize: '11px', color: '#858585', display: 'block', marginBottom: '4px' }}>Модель (например llama3.2, codellama):</label>
+                    <input
+                      type="text"
+                      placeholder="llama3.2"
+                      value={ollamaModel}
+                      onChange={(e) => setOllamaModel(e.target.value)}
+                      style={{
+                        width: '100%',
+                        padding: '6px 8px',
+                        background: '#2d2d30',
+                        border: '1px solid #3e3e3e',
+                        color: '#d4d4d4',
+                        borderRadius: 4,
+                        fontSize: '12px'
+                      }}
+                      title="Имя модели Ollama. Установите с ollama.com, затем: ollama run llama3.2"
+                    />
+                    <div style={{ marginTop: '6px', fontSize: '11px', color: '#858585' }}>
+                      Установите <a href="https://ollama.com" target="_blank" rel="noopener noreferrer" style={{ color: '#58a6ff' }}>Ollama</a>, затем в терминале: <code>ollama run {ollamaModel || 'llama3.2'}</code>
+                    </div>
                   </div>
                   <div className="setting-group" style={{ marginBottom: '8px' }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px' }}>
@@ -4791,6 +4992,14 @@ function App() {
                       >
                         🧹
                       </button>
+                      <button 
+                        className={`btn btn-secondary ${showAiPanel ? 'active' : ''}`}
+                        onClick={() => setShowAiPanel(!showAiPanel)}
+                        style={{ padding: '2px 8px', fontSize: '11px' }}
+                        title={showAiPanel ? 'Скрыть окно AI-ассистента' : 'Показать окно AI-ассистента (перетаскиваемое)'}
+                      >
+                        AI Assistant
+                      </button>
                     </div>
                   </div>
                 </div>
@@ -4831,7 +5040,11 @@ function App() {
                       fontFamily: fontFamily,
                       fontSize: `${fontSize}px`,
                       fontStyle: fontStyle,
-                      color: output1 ? fontColor : '#6a6a6a'
+                      color: output1 ? fontColor : '#6a6a6a',
+                      margin: 0,
+                      padding: '8px',
+                      whiteSpace: 'pre-wrap',
+                      wordBreak: 'break-word'
                     }}
                   >
                     {output1 || (sqlMode ? 'Результат появится здесь после нажатия «Выполнить» (Ctrl+Enter / F8)' : 'Вывод появится здесь после выполнения кода...')}
@@ -4944,6 +5157,11 @@ function App() {
                           <span style={{ fontWeight: 'bold', color: '#d4d4d4', fontSize: '12px' }}>Данные таблицы: {sqlTableDataView.tableName}</span>
                           <button className="btn btn-secondary" onClick={() => setSqlTableDataView(null)} style={{ padding: '2px 8px', fontSize: '11px' }}>Закрыть</button>
                         </div>
+                        {(sqlTableDataView.totalRows != null && sqlTableDataView.totalRows > (sqlTableDataView.rows || []).length) ? (
+                          <div style={{ padding: '4px 10px', fontSize: '11px', color: '#858585', background: '#252526', borderBottom: '1px solid #3e3e3e' }}>
+                            Показано {(sqlTableDataView.rows || []).length} из {sqlTableDataView.totalRows} строк
+                          </div>
+                        ) : null}
                         <div style={{ overflow: 'auto', maxHeight: '280px' }}>
                           <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '11px' }}>
                             <thead>
@@ -4957,7 +5175,7 @@ function App() {
                               {sqlTableDataView.loading ? (
                                 <tr><td colSpan={Math.max(1, (sqlTableDataView.columns || []).length)} style={{ padding: '12px', color: '#858585' }}>Загрузка...</td></tr>
                               ) : (sqlTableDataView.rows || []).length === 0 ? (
-                                <tr><td colSpan={(sqlTableDataView.columns || []).length} style={{ padding: '12px', color: '#858585' }}>(0 строк)</td></tr>
+                                <tr><td colSpan={Math.max(1, (sqlTableDataView.columns || []).length)} style={{ padding: '12px', color: '#858585' }}>(0 строк)</td></tr>
                               ) : (sqlTableDataView.rows || []).map((row, ri) => (
                                 <tr key={ri} style={{ borderBottom: '1px solid #2a2a2a' }}>
                                   {(sqlTableDataView.columns || []).map((colName, ci) => {
@@ -5872,14 +6090,24 @@ function App() {
               <div className="output-header">
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%' }}>
                   <span className="output-title">Результат выполнения</span>
-                  <button 
-                    className="btn btn-secondary"
-                    onClick={clearOutput}
-                    style={{ padding: '2px 8px', fontSize: '11px' }}
-                    title="Очистить вывод"
-                  >
-                    🧹
-                  </button>
+                  <div style={{ display: 'flex', gap: '6px' }}>
+                    <button 
+                      className="btn btn-secondary"
+                      onClick={clearOutput}
+                      style={{ padding: '2px 8px', fontSize: '11px' }}
+                      title="Очистить вывод"
+                    >
+                      🧹
+                    </button>
+                    <button 
+                      className={`btn btn-secondary ${showAiPanel ? 'active' : ''}`}
+                      onClick={() => setShowAiPanel(!showAiPanel)}
+                      style={{ padding: '2px 8px', fontSize: '11px' }}
+                      title={showAiPanel ? 'Скрыть окно AI-ассистента' : 'Показать окно AI-ассистента (перетаскиваемое)'}
+                    >
+                      AI Assistant
+                    </button>
+                  </div>
                 </div>
               </div>
               {language === 'java' && (
@@ -5929,6 +6157,288 @@ function App() {
           </>
         )}
       </div>
+
+      {/* Окно AI-ассистента: перетаскивается за заголовок, размер — за правый нижний угол */}
+      {showAiPanel && (
+        <div
+          style={{
+            position: 'fixed',
+            left: aiPanelLeft,
+            top: aiPanelTop,
+            width: aiPanelWidth,
+            height: aiPanelHeight,
+            minWidth: AI_PANEL_MIN_WIDTH,
+            minHeight: AI_PANEL_MIN_HEIGHT,
+            background: '#252526',
+            border: '1px solid #3e3e3e',
+            borderRadius: '8px',
+            boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
+            display: 'flex',
+            flexDirection: 'column',
+            overflow: 'hidden',
+            zIndex: 10000
+          }}
+        >
+          <div
+            onMouseDown={(e) => {
+              e.preventDefault();
+              aiPanelDragRef.current = {
+                startX: e.clientX,
+                startY: e.clientY,
+                startLeft: aiPanelLeft,
+                startTop: aiPanelTop
+              };
+              setIsDraggingAiPanel(true);
+            }}
+            style={{
+              padding: '8px 10px',
+              borderBottom: '1px solid #3e3e3e',
+              fontSize: '12px',
+              color: '#d4d4d4',
+              fontWeight: 'bold',
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              background: '#2d2d30',
+              cursor: 'move',
+              userSelect: 'none'
+            }}
+            title="Перетащите окно"
+          >
+            <span>
+              AI Assistant (Ollama) · Модель: <strong style={{ color: '#79c0ff' }}>{ollamaModel || 'llama3.2'}</strong>
+              {' · '}
+              Чат: <strong style={{ color: '#a5d6ff' }}>{splitView ? (tabs1.find(t => t.id === activeTab1)?.name ?? 'Вкладка') : (tabs.find(t => t.id === activeTab)?.name ?? 'Вкладка')}</strong>
+            </span>
+            <div style={{ display: 'flex', gap: '4px' }}>
+              <button
+                type="button"
+                onClick={() => setAiMessagesByTab(prev => ({ ...prev, [aiChatKey]: [] }))}
+                className="btn btn-secondary"
+                style={{ padding: '2px 6px', fontSize: '11px' }}
+                title="Очистить чат в этой вкладке"
+              >
+                Очистить чат
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowAiPanel(false)}
+                className="btn btn-secondary"
+                style={{ padding: '2px 6px', fontSize: '11px' }}
+                title="Закрыть окно"
+              >
+                ✕
+              </button>
+            </div>
+          </div>
+          <div style={{ flex: 1, overflow: 'auto', padding: '8px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+            {aiMessages.length === 0 && (
+              <div style={{ color: '#d4d4d4', fontSize: '12px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                <div style={{ fontWeight: 'bold', marginBottom: '4px' }}>Скачайте Ollama</div>
+                {ollamaDownloadProgress != null ? (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                    <div style={{ color: '#858585', fontSize: '11px' }}>Загрузка… {ollamaDownloadProgress.percent ?? 0}%</div>
+                    <div style={{ width: '100%', maxWidth: '280px', height: '8px', background: '#2d2d30', borderRadius: '4px', overflow: 'hidden' }}>
+                      <div style={{ width: `${ollamaDownloadProgress.percent ?? 0}%`, height: '100%', background: '#0e639c', transition: 'width 0.2s ease' }} />
+                    </div>
+                  </div>
+                ) : ollamaDownloadDone != null ? (
+                  <div style={{ padding: '8px', background: '#2d2d30', borderRadius: '4px', fontSize: '11px' }}>
+                    {ollamaDownloadDone.state === 'completed' ? (
+                      <>Готово. Файл сохранён в папку «Загрузки»: <code style={{ wordBreak: 'break-all' }}>{ollamaDownloadDone.path || 'OllamaSetup.exe'}</code>. Запустите установщик после завершения загрузки.</>
+                    ) : (
+                      <>Загрузка прервана или ошибка ({ollamaDownloadDone.state}).</>
+                    )}
+                  </div>
+                ) : ipcRenderer ? (
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    style={{ alignSelf: 'flex-start', padding: '8px 14px', fontSize: '13px' }}
+                    onClick={() => { setOllamaDownloadDone(null); ipcRenderer.invoke('download-ollama-windows'); }}
+                  >
+                    Скачать Ollama (показать прогресс)
+                  </button>
+                ) : (
+                  <a
+                    href="https://ollama.com/download"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="btn btn-primary"
+                    style={{ alignSelf: 'flex-start', padding: '8px 14px', fontSize: '13px', textDecoration: 'none' }}
+                  >
+                    Скачать Ollama
+                  </a>
+                )}
+                <div style={{ marginTop: '4px' }}>
+                  <label style={{ display: 'block', marginBottom: '6px', color: '#858585' }}>Используется модель:</label>
+                  <select
+                    value={ollamaModel || 'llama3.2'}
+                    onChange={(e) => setOllamaModel(e.target.value)}
+                    style={{
+                      width: '100%',
+                      maxWidth: '260px',
+                      padding: '6px 8px',
+                      background: '#2d2d30',
+                      border: '1px solid #79c0ff',
+                      color: '#d4d4d4',
+                      borderRadius: 4,
+                      fontSize: '12px'
+                    }}
+                    title={`Текущая модель: ${ollamaModel || 'llama3.2'}`}
+                  >
+                    <option value="llama3.2">llama3.2</option>
+                    <option value="llama3.1">llama3.1</option>
+                    <option value="codellama">codellama</option>
+                    <option value="qwen2.5-coder">qwen2.5-coder</option>
+                    <option value="qwen3-coder:30b">qwen3-coder:30b</option>
+                    <option value="qwen3:30b">qwen3:30b</option>
+                    <option value="qwen3:8b">qwen3:8b</option>
+                    <option value="qwen3:4b">qwen3:4b</option>
+                    <option value="qwen3-vl:30b">qwen3-vl:30b</option>
+                    <option value="qwen3-vl:8b">qwen3-vl:8b</option>
+                    <option value="qwen3-vl:4b">qwen3-vl:4b</option>
+                    <option value="gemma3:27b">gemma3:27b</option>
+                    <option value="gemma3:12b">gemma3:12b</option>
+                    <option value="gemma3:4b">gemma3:4b</option>
+                    <option value="gemma3:4h">gemma3:4h</option>
+                    <option value="gemma3:1b">gemma3:1b</option>
+                    <option value="gemma2">gemma2</option>
+                    <option value="deepseek-r1:8b">deepseek-r1:8b</option>
+                    <option value="gpt-oss:120b">gpt-oss:120b</option>
+                    <option value="gpt-oss:20b">gpt-oss:20b</option>
+                    <option value="mistral">mistral</option>
+                    <option value="phi3">phi3</option>
+                  </select>
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                  <span style={{ color: '#858585', fontSize: '11px' }}>После установки Ollama запустите модель — прямо здесь, без терминала:</span>
+                  {ipcRenderer ? (
+                    <>
+                      <button
+                        type="button"
+                        className="btn btn-primary"
+                        style={{ alignSelf: 'flex-start', padding: '8px 14px', fontSize: '12px' }}
+                        onClick={async () => {
+                          try {
+                            const r = await ipcRenderer.invoke('ollama-run-model', ollamaModel || 'llama3.2');
+                            const msg = r?.error
+                              ? 'Не удалось запустить модель: ' + r.error + '. Убедитесь, что Ollama установлена и доступна в PATH.'
+                              : 'Модель «' + (ollamaModel || 'llama3.2') + '» запускается в фоне. Через несколько секунд можно задавать вопросы в чате.';
+                            setAiMessagesByTab(prev => ({ ...prev, [aiChatKey]: [...(prev[aiChatKey] || []), { role: 'assistant', content: msg }] }));
+                          } catch (e) {
+                            setAiMessagesByTab(prev => ({ ...prev, [aiChatKey]: [...(prev[aiChatKey] || []), { role: 'assistant', content: 'Ошибка запуска: ' + (e.message || String(e)) }] }));
+                          }
+                        }}
+                      >
+                        Запустить модель {ollamaModel || 'llama3.2'}
+                      </button>
+                      <span style={{ color: '#6a6a6a', fontSize: '11px' }}>Или в терминале: <code>ollama run {ollamaModel || 'llama3.2'}</code></span>
+                    </>
+                  ) : (
+                    <span style={{ color: '#858585', fontSize: '11px' }}>В терминале выполните: <code>ollama run {ollamaModel || 'llama3.2'}</code></span>
+                  )}
+                </div>
+                <div style={{ color: '#858585', fontSize: '11px', marginTop: '4px' }}>
+                  Код из текущей вкладки подставляется в запрос автоматически.
+                </div>
+              </div>
+            )}
+            {aiMessages.map((msg, i) => (
+              <div
+                key={i}
+                style={{
+                  alignSelf: msg.role === 'user' ? 'flex-end' : 'flex-start',
+                  maxWidth: '90%',
+                  padding: '8px 10px',
+                  borderRadius: '8px',
+                  background: msg.role === 'user' ? '#0e639c' : '#2d2d30',
+                  color: '#d4d4d4',
+                  fontSize: `${fontSize}px`,
+                  fontFamily: fontFamily,
+                  whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-word'
+                }}
+              >
+                {msg.content}
+              </div>
+            ))}
+            {aiLoading && (
+              <div style={{ color: '#858585', fontSize: '12px' }}>Ожидание ответа...</div>
+            )}
+          </div>
+          <div style={{ padding: '8px', borderTop: '1px solid #3e3e3e', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+            <div style={{ fontSize: '11px', color: '#858585' }}>Модель: <span style={{ color: '#79c0ff', fontWeight: 'bold' }}>{ollamaModel || 'llama3.2'}</span></div>
+            <div style={{ display: 'flex', gap: '6px', alignItems: 'flex-end' }}>
+            <textarea
+              ref={aiInputRef}
+              value={aiInput}
+              onChange={(e) => {
+                setAiInput(e.target.value);
+                const el = e.target;
+                el.style.height = 'auto';
+                el.style.height = Math.min(el.scrollHeight, 200) + 'px';
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  if (aiInput.trim()) sendAiMessage(aiInput.trim());
+                }
+              }}
+              placeholder="Вопрос по коду… (Shift+Enter — новая строка)"
+              disabled={aiLoading}
+              rows={1}
+              style={{
+                flex: 1,
+                minHeight: 36,
+                maxHeight: 200,
+                resize: 'none',
+                overflow: 'auto',
+                padding: '6px 8px',
+                background: '#1e1e1e',
+                border: '1px solid #3e3e3e',
+                color: fontColor,
+                borderRadius: 4,
+                fontSize: '12px',
+                fontFamily: fontFamily
+              }}
+            />
+            <button
+              className="btn btn-primary"
+              onClick={() => aiInput.trim() && sendAiMessage(aiInput.trim())}
+              disabled={aiLoading}
+              style={{ padding: '6px 12px', fontSize: '12px' }}
+            >
+              Отправить
+            </button>
+            </div>
+          </div>
+          <div
+            onMouseDown={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              aiPanelResizeRef.current = {
+                startX: e.clientX,
+                startY: e.clientY,
+                startWidth: aiPanelWidth,
+                startHeight: aiPanelHeight
+              };
+              setIsResizingAiPanel(true);
+            }}
+            style={{
+              position: 'absolute',
+              right: 0,
+              bottom: 0,
+              width: 24,
+              height: 24,
+              cursor: 'se-resize',
+              background: 'linear-gradient(135deg, transparent 50%, #3e3e3e 50%, #3e3e3e 55%, transparent 55%)',
+              borderRadius: '0 0 8px 0'
+            }}
+            title="Потяните для изменения размера окна"
+          />
+        </div>
+      )}
 
       {/* Модальное окно выбора окна */}
       {showWindowChoiceModal && (

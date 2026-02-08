@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, globalShortcut } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, globalShortcut, session } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { spawn, exec } = require('child_process');
@@ -151,6 +151,9 @@ function createWindow() {
       
       mainWindow.webContents.on('did-finish-load', () => {
         writeLog('INFO', 'Page finished loading');
+        if (isDev) {
+          mainWindow.webContents.openDevTools();
+        }
         // Проверяем, загрузился ли React
         mainWindow.webContents.executeJavaScript(`
           setTimeout(() => {
@@ -1388,4 +1391,44 @@ ipcMain.handle('execute-oracle', async (event, { connection, query }) => {
     if (connection_) try { await connection_.close(); } catch (_) {}
     return { error: err.message };
   }
+});
+
+// Загрузка установщика Ollama для Windows с отображением прогресса
+const OLLAMA_SETUP_URL = 'https://ollama.com/download/OllamaSetup.exe';
+ipcMain.handle('download-ollama-windows', async (event) => {
+  const sender = event.sender;
+  const downloadPath = path.join(app.getPath('downloads'), 'OllamaSetup.exe');
+  session.defaultSession.once('will-download', (e, item) => {
+    item.setSavePath(downloadPath);
+    item.on('updated', (ev, state) => {
+      if (state === 'progressing') {
+        const received = item.getReceivedBytes();
+        const total = item.getTotalBytes();
+        const percent = total > 0 ? Math.min(100, Math.round((received / total) * 100)) : 0;
+        sender.send('ollama-download-progress', { received, total, percent });
+      }
+    });
+    item.once('done', (ev, state) => {
+      sender.send('ollama-download-done', { state, path: downloadPath });
+    });
+  });
+  session.defaultSession.downloadURL(OLLAMA_SETUP_URL);
+  return { started: true, path: downloadPath };
+});
+
+// Запуск модели Ollama (ollama run <model>) без терминала — из приложения
+ipcMain.handle('ollama-run-model', async (event, model) => {
+  const name = (model && String(model).trim()) || 'llama3.2';
+  return new Promise((resolve) => {
+    const child = spawn(process.platform === 'win32' ? 'ollama' : 'ollama', ['run', name], {
+      detached: true,
+      stdio: 'ignore',
+      shell: true,
+      windowsHide: true
+    });
+    child.unref();
+    child.on('error', (err) => resolve({ started: false, error: err.message }));
+    child.on('spawn', () => resolve({ started: true }));
+    setTimeout(() => resolve({ started: true }), 500);
+  });
 });
