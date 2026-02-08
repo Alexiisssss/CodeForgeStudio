@@ -313,6 +313,14 @@
   min-width: 0;
 }
 
+/* В одном окне (grid) панель вывода занимает вторую колонку без ограничения 50% */
+.one-window-split .output-container.one-window-output {
+  width: 100%;
+  max-width: none;
+  min-width: 0;
+  flex-shrink: 1;
+}
+
 .output-resizer {
   width: 4px;
   background: #3e3e3e;

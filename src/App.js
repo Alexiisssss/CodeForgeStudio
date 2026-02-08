@@ -30,6 +30,7 @@ function App() {
   const [isRunning, setIsRunning] = useState(false);
   const [outputHeight, setOutputHeight] = useState(300);
   const [outputWidth, setOutputWidth] = useState(400);
+  const [oneWindowEditorPercent, setOneWindowEditorPercent] = useState(50); // процент ширины редактора в одном окне (10–90), как у 2 окон
   const [isResizing, setIsResizing] = useState(false);
   const [isResizingVertical, setIsResizingVertical] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
@@ -173,6 +174,8 @@ function App() {
   const editorViewRef1 = useRef(null);
   const editorViewRef2 = useRef(null);
   const splitDividerRef = useRef(null);
+  const splitContainerRef = useRef(null);
+  const oneWindowContainerRef = useRef(null);
   const editorViewRef = useRef(null);
   const createNewTabLockRef = useRef(0); // время последнего создания вкладки (для защиты от двойного клика)
   const CREATE_TAB_COOLDOWN_MS = 400;
@@ -3535,14 +3538,35 @@ function App() {
     }
   }, [code2, output2, language2, activeTab2, splitView]);
 
-  // Загружаем данные активной вкладки при переключении
+  // Загружаем данные активной вкладки при переключении (single view)
   useEffect(() => {
+    if (splitView || !activeTab) return;
     const tab = tabs.find(t => t.id === activeTab);
-    if (tab && (tab.code !== code || tab.output !== output || tab.language !== language)) {
-      // Обновляем только если данные вкладки отличаются от текущих
-      // Это предотвращает бесконечный цикл
-    }
-  }, [activeTab, tabs]);
+    if (!tab) return;
+    if (tab.code !== code) setCode(tab.code ?? '');
+    if (tab.output !== output) setOutput(tab.output ?? '');
+    if (tab.language !== language) setLanguage(tab.language || 'javascript');
+  }, [activeTab, tabs, splitView]);
+
+  // Загружаем данные активной вкладки окна 1 при переключении (split view)
+  useEffect(() => {
+    if (!splitView || !activeTab1) return;
+    const tab = tabs1.find(t => t.id === activeTab1);
+    if (!tab) return;
+    if (tab.code !== code1) setCode1(tab.code ?? '');
+    if (tab.output !== output1) setOutput1(tab.output ?? '');
+    if (tab.language !== language1) setLanguage1(tab.language || 'javascript');
+  }, [activeTab1, tabs1, splitView]);
+
+  // Загружаем данные активной вкладки окна 2 при переключении (split view)
+  useEffect(() => {
+    if (!splitView || !activeTab2) return;
+    const tab = tabs2.find(t => t.id === activeTab2);
+    if (!tab) return;
+    if (tab.code !== code2) setCode2(tab.code ?? '');
+    if (tab.output !== output2) setOutput2(tab.output ?? '');
+    if (tab.language !== language2) setLanguage2(tab.language || 'javascript');
+  }, [activeTab2, tabs2, splitView]);
 
   // Функция дублирования строки (дублирует СНИЗУ)
   const duplicateLine = useCallback((view) => {
@@ -3732,15 +3756,24 @@ function App() {
   // const sqlSourceForTables = sqlMode && splitView ? code1 : (sqlMode ? code : '');
   // useEffect отключен - обновление таблиц происходит только в executeCode1
 
-  // Обработчик горизонтального ресайза (для одного окна - устаревший, оставляем для совместимости)
+  // Обработчик горизонтального ресайза для одного окна — та же логика, что у 2 окон: процент от ширины контейнера (10–90%)
   useEffect(() => {
     const handleMouseMove = (e) => {
-      if (isResizing) {
-        const newWidth = window.innerWidth - e.clientX;
-        if (newWidth >= 200 && newWidth <= window.innerWidth - 400) {
-          setOutputWidth(newWidth);
-        }
+      if (!isResizing) return;
+      const container = oneWindowContainerRef.current || document.querySelector('.one-window-split');
+      if (!container) return;
+      const rect = container.getBoundingClientRect();
+      const totalWidth = rect.width;
+      if (totalWidth <= 0) return;
+      const mouseX = e.clientX - rect.left;
+      const percentage = (mouseX / totalWidth) * 100;
+      const clamped = Math.max(10, Math.min(90, percentage));
+      setOneWindowEditorPercent(clamped);
+      if (oneWindowContainerRef.current) {
+        oneWindowContainerRef.current.style.gridTemplateColumns = `${clamped}% minmax(0, 1fr)`;
       }
+      const div = oneWindowContainerRef.current?.querySelector('.one-window-divider');
+      if (div) div.style.left = `calc(${clamped}% - 8px)`;
     };
 
     const handleMouseUp = () => {
@@ -3858,15 +3891,22 @@ function App() {
   useEffect(() => {
     const handleMouseMove = (e) => {
       if (!isResizingSplit) return;
-      const container = document.querySelector('.split-container');
+      const container = splitContainerRef.current || document.querySelector('.split-container');
       if (!container) return;
       const rect = container.getBoundingClientRect();
       const totalWidth = rect.width;
+      if (totalWidth <= 0) return;
       const mouseX = e.clientX - rect.left;
       const percentage = (mouseX / totalWidth) * 100;
-      // Ограничиваем от 20% до 80%
-      const clampedPercentage = Math.max(20, Math.min(80, percentage));
+      const clampedPercentage = Math.max(10, Math.min(90, percentage));
       setSplitPaneWidth(clampedPercentage);
+      // Прямое обновление DOM во время перетаскивания, чтобы линия двигалась влево/вправо без задержки
+      if (splitContainerRef.current) {
+        splitContainerRef.current.style.gridTemplateColumns = `${clampedPercentage}% minmax(0, 1fr)`;
+      }
+      if (splitDividerRef.current) {
+        splitDividerRef.current.style.left = `calc(${clampedPercentage}% - 8px)`;
+      }
     };
 
     const handleMouseUp = () => {
@@ -4013,6 +4053,17 @@ function App() {
       setAiLoading(false);
     }
   }, [ollamaModel, aiMessages, aiChatKey, getEditorContextForAi, splitView, tabs1, activeTab1, tabs, activeTab]);
+
+  // Перенести ответ AI в блок кода слева (полностью заменить содержимое текущей вкладки)
+  const insertAiResponseToCode = useCallback((content) => {
+    if (splitView) {
+      setCode1(content);
+      setTabs1(prev => prev.map(tab => tab.id === activeTab1 ? { ...tab, code: content } : tab));
+    } else {
+      setCode(content);
+      setTabs(prev => prev.map(tab => tab.id === activeTab ? { ...tab, code: content } : tab));
+    }
+  }, [splitView, activeTab1, activeTab]);
 
   // Перетаскивание окна AI-ассистента
   useEffect(() => {
@@ -4648,9 +4699,18 @@ function App() {
 
       <div className="main-container">
         {splitView ? (
-          <div className="split-container" style={{ position: 'relative' }}>
+          <div 
+            ref={splitContainerRef}
+            className="split-container" 
+            style={{ 
+              position: 'relative', 
+              display: 'grid', 
+              gridTemplateColumns: `${splitPaneWidth}% minmax(0, 1fr)`,
+              gap: 0 
+            }}
+          >
             {/* Окно 1 - слева */}
-            <div className="split-pane-container" style={{ width: `${splitPaneWidth}%`, flex: '0 0 auto' }}>
+            <div className="split-pane-container" style={{ minWidth: 0 }}>
               <div className="editor-container split-pane">
                 <div className="editor-header">
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%' }}>
@@ -5071,7 +5131,7 @@ function App() {
             />
             
             {/* Окно 2 - справа */}
-            <div className="split-pane-container" style={{ width: `${100 - splitPaneWidth}%`, flex: '0 0 auto', minWidth: 0 }}>
+            <div className="split-pane-container" style={{ minWidth: 0 }}>
               {sqlMode ? (
                 <div className="editor-container split-pane">
                   <div className="editor-header">
@@ -5850,11 +5910,22 @@ function App() {
                   </div>
                 </>
               )}
+              </div>
             </div>
-          </div>
         ) : (
-          <>
-            <div className="editor-container">
+          <div
+            ref={oneWindowContainerRef}
+            className="one-window-split main-container-one"
+            style={{
+              display: 'grid',
+              gridTemplateColumns: `${oneWindowEditorPercent}% minmax(0, 1fr)`,
+              gap: 0,
+              position: 'relative',
+              flex: 1,
+              overflow: 'hidden',
+            }}
+          >
+            <div className="editor-container" style={{ minWidth: 0 }}>
               <div className="editor-header">
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%' }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
@@ -6082,11 +6153,16 @@ function App() {
                 />
               </div>
             </div>
-            <div 
-              className="output-resizer"
+            {/* Разделитель как оверлей — как у 2 окон, позиция по проценту */}
+            <div
+              className="split-divider split-divider-overlay one-window-divider"
+              style={{ left: `calc(${oneWindowEditorPercent}% - 8px)`, width: 16 }}
               onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); setIsResizing(true); }}
+              role="separator"
+              aria-orientation="vertical"
+              title="Перетащите для изменения ширины"
             />
-            <div className="output-container" style={{ width: `${outputWidth}px` }}>
+            <div className="output-container one-window-output" style={{ minWidth: 0 }}>
               <div className="output-header">
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%' }}>
                   <span className="output-title">Результат выполнения</span>
@@ -6154,7 +6230,7 @@ function App() {
                 </pre>
               </div>
             </div>
-          </>
+          </div>
         )}
       </div>
 
@@ -6357,10 +6433,24 @@ function App() {
                   fontSize: `${fontSize}px`,
                   fontFamily: fontFamily,
                   whiteSpace: 'pre-wrap',
-                  wordBreak: 'break-word'
+                  wordBreak: 'break-word',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '6px'
                 }}
               >
-                {msg.content}
+                <div>{msg.content}</div>
+                {msg.role === 'assistant' && (
+                  <button
+                    type="button"
+                    onClick={() => insertAiResponseToCode(msg.content)}
+                    className="btn btn-secondary"
+                    style={{ alignSelf: 'flex-start', padding: '4px 8px', fontSize: '11px' }}
+                    title="Заменить код слева этим текстом"
+                  >
+                    ← В код
+                  </button>
+                )}
               </div>
             ))}
             {aiLoading && (
