@@ -14,6 +14,7 @@ A clean, fast desktop code editor with execution, compilation, file handling, an
 - 📂 **Recent files** — dropdown of last opened/saved files
 - 📑 **Split view** — left and right panes, each with its own tabs and Open/Save buttons
 - 🗄️ **SQL mode** — queries on the left, tables and ER diagram on the right (SQLite in-memory, PostgreSQL, Oracle)
+- 🤖 **AI assistant (Ollama)** — chat with a local model inside the app. **Reads context:** code from the current tab is automatically sent with each question, so you can ask “what’s wrong here?” or “explain this function” without pasting. Separate chat per tab; draggable, resizable window.
 - ⌨️ Shortcuts (F8, Ctrl+Enter, Ctrl+Alt+L, Ctrl+T, etc.)
 - 💾 Auto-save of tabs and code to localStorage; **dirty tabs** (• in the name and a prompt when closing)
 
@@ -81,6 +82,13 @@ In **Split view**, the right pane has its own **Open / Save / Save As** for the 
 
 - The **SQL** button switches to query mode: SQL editor on the left, table list, table data view, and ER diagram on the right.
 - Dialects: **SQL (in-memory)** (sql.js), **PostgreSQL**, **Oracle** (connection settings in the panel for the last two).
+
+### AI assistant (Ollama)
+
+- The **AI Assistant** button next to “Clear” in the **Run result** panel opens a chat window with a local [Ollama](https://ollama.com) model.
+- **Code context:** each message automatically includes the code from the **current tab** (or the current selection). You can ask “what’s wrong?” or “explain this function” and the model sees your code.
+- Each tab has **its own chat**: switching tabs shows that tab’s history (empty or ongoing).
+- In the chat window: model selector (llama3.2, gemma3:4b, qwen3:8b, etc.), “Run model” without a terminal, and optional Ollama installer download with progress. The window can be dragged and resized from the bottom-right corner.
 
 ## 🛠️ Supported languages
 
