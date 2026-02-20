@@ -9,13 +9,15 @@ import { css } from '@codemirror/lang-css';
 import { go } from '@codemirror/lang-go';
 import { oneDark } from '@codemirror/theme-one-dark';
 import { EditorView, keymap, highlightActiveLine, highlightActiveLineGutter, Decoration, ViewPlugin, WidgetType } from '@codemirror/view';
+import { Prec } from '@codemirror/state';
 
 import { syntaxHighlighting, HighlightStyle } from '@codemirror/language';
 import { tags } from '@lezer/highlight';
-import { autocompletion, CompletionContext } from '@codemirror/autocomplete';
-import { StateField, EditorState, EditorSelection } from '@codemirror/state';
+import { autocompletion, CompletionContext, acceptCompletion, completionKeymap } from '@codemirror/autocomplete';
+import { StateField, StateEffect, EditorState, EditorSelection } from '@codemirror/state';
 import { selectAll, toggleComment } from '@codemirror/commands';
 import { bracketMatching, foldGutter, foldKeymap } from '@codemirror/language';
+import JSZip from 'jszip';
 import './App.css';
 
 const { ipcRenderer } = window.require ? window.require('electron') : { ipcRenderer: null };
@@ -1670,17 +1672,111 @@ function App() {
     return keywords[language] || keywords.javascript;
   }, [language]);
 
-  // Умное автодополнение - находит переменные, функции и классы из текущего кода + ключевые слова языка
+  // Кастомный keymap для автодополнения - Tab принимает предложение, если оно открыто
+  const customCompletionKeymap = useMemo(() => {
+    return Prec.high(keymap.of([
+      {
+        key: 'Tab',
+        run: (view) => {
+          // Проверяем, открыто ли автодополнение
+          const tooltip = view.dom.querySelector('.cm-tooltip-autocomplete, .cm-tooltip[class*="autocomplete"]');
+          const isOpen = tooltip && (
+            tooltip.offsetParent !== null || 
+            window.getComputedStyle(tooltip).display !== 'none'
+          );
+          
+          if (isOpen) {
+            // Пытаемся принять автодополнение
+            const result = acceptCompletion(view);
+            if (result) return true;
+          }
+          
+          // Если автодополнение не открыто или не удалось принять, возвращаем false
+          // чтобы другие обработчики (tabCompletionExtension) могли обработать Tab
+          return false;
+        }
+      }
+    ]));
+  }, []);
+
+  // Умное автодополнение - находит переменные, функции и классы из текущего кода + ключевые слова языка + сниппеты
   const smartAutocomplete = useMemo(() => {
-    return autocompletion({
-      override: [
+    return [
+      autocompletion({
+        override: [
         (context) => {
           const word = context.matchBefore(/\w*/);
           if (!word || word.text.length < 1) return null;
           
           const text = context.state.doc.toString();
+          const pos = context.pos;
+          const line = context.state.doc.lineAt(pos);
+          const lineText = line.text;
+          const lineStart = line.from;
+          const beforeCursor = lineText.substring(0, pos - lineStart);
+          
           const suggestions = [];
           const seen = new Set();
+          
+          // СНИППЕТЫ для разных языков
+          const snippets = [];
+          if (language === 'java') {
+            snippets.push(
+              { trigger: 'psvm', label: 'psvm', detail: 'public static void main', template: 'public static void main(String[] args) {\n\t$0\n}', type: 'snippet' },
+              { trigger: 'sout', label: 'sout', detail: 'System.out.println', template: 'System.out.println($0);', type: 'snippet' },
+              { trigger: 'soutv', label: 'soutv', detail: 'System.out.println with variable', template: 'System.out.println("$1 = " + $1);', type: 'snippet' },
+              { trigger: 'fori', label: 'fori', detail: 'for loop with index', template: 'for (int $1 = 0; $1 < $2.length; $1++) {\n\t$0\n}', type: 'snippet' },
+              { trigger: 'fore', label: 'fore', detail: 'for-each loop', template: 'for ($1 $2 : $3) {\n\t$0\n}', type: 'snippet' },
+              { trigger: 'ifn', label: 'ifn', detail: 'if null', template: 'if ($1 == null) {\n\t$0\n}', type: 'snippet' },
+              { trigger: 'inn', label: 'inn', detail: 'if not null', template: 'if ($1 != null) {\n\t$0\n}', type: 'snippet' }
+            );
+          } else if (language === 'javascript' || language === 'typescript') {
+            snippets.push(
+              { trigger: 'clg', label: 'clg', detail: 'console.log', template: 'console.log($0);', type: 'snippet' },
+              { trigger: 'clge', label: 'clge', detail: 'console.log error', template: 'console.error($0);', type: 'snippet' },
+              { trigger: 'clgw', label: 'clgw', detail: 'console.log warn', template: 'console.warn($0);', type: 'snippet' }
+            );
+          } else if (language === 'python') {
+            snippets.push(
+              { trigger: 'pr', label: 'pr', detail: 'print', template: 'print($0)', type: 'snippet' }
+            );
+          }
+          
+          // Добавляем сниппеты, если они совпадают с текущим словом
+          const wordLower = word.text.toLowerCase();
+          snippets.forEach(snippet => {
+            if (snippet.trigger.toLowerCase().startsWith(wordLower)) {
+              // Создаем функцию apply для сниппета с обработкой плейсхолдеров
+              const applySnippet = (view, completion, from, to) => {
+                let text = snippet.template;
+                // Обработка плейсхолдеров: $0 - позиция курсора, остальные удаляем для простоты
+                const cursorPos = text.indexOf('$0');
+                if (cursorPos !== -1) {
+                  text = text.replace(/\$0/g, '');
+                  // Удаляем остальные плейсхолдеры ($1, $2, $3 и т.д.)
+                  text = text.replace(/\$\d+/g, '');
+                } else {
+                  // Если нет $0, удаляем все плейсхолдеры и ставим курсор в конец
+                  text = text.replace(/\$\d+/g, '');
+                }
+                
+                view.dispatch({
+                  changes: { from, to, insert: text },
+                  selection: cursorPos !== -1 
+                    ? { anchor: from + cursorPos }
+                    : { anchor: from + text.length }
+                });
+              };
+              
+              suggestions.push({
+                label: snippet.label,
+                type: snippet.type || 'snippet',
+                detail: snippet.detail,
+                info: snippet.detail,
+                apply: applySnippet
+              });
+            }
+          });
           
           // Добавляем ключевые слова языка
           const keywords = languageKeywords;
@@ -1752,12 +1848,14 @@ function App() {
             }
           }
           
-          // Находим методы классов (для Java, C++, etc)
-          const methodPattern = /(?:public|private|protected)?\s*(?:static)?\s*\w+\s+(\w+)\s*\(/g;
+          // Находим методы классов (для Java, C++, etc) - улучшенный поиск
+          const methodPattern = /(?:public|private|protected)?\s*(?:static)?\s*(?:final)?\s*\w+\s+(\w+)\s*\([^)]*\)/g;
+          const methods = [];
           while ((match = methodPattern.exec(text)) !== null) {
             const name = match[1];
             if (!seen.has(name) && name !== 'main') {
               seen.add(name);
+              methods.push(name);
               suggestions.push({
                 label: name,
                 type: 'method',
@@ -1766,11 +1864,41 @@ function App() {
             }
           }
           
+          // Улучшенный поиск методов в контексте (например, в sout, System.out.println и т.д.)
+          // Если пользователь пишет в контексте вызова метода (например, System.out.println(|) или sout(|))
+          const isInMethodCall = /(?:System\.out\.println|sout|console\.log|print)\s*\([^)]*$/i.test(beforeCursor);
+          if (isInMethodCall && methods.length > 0) {
+            // Добавляем методы с приоритетом, если мы в контексте вызова
+            methods.forEach(methodName => {
+              const existing = suggestions.find(s => s.label === methodName);
+              if (!existing) {
+                suggestions.unshift({
+                  label: methodName,
+                  type: 'method',
+                  info: 'Метод из вашего кода (в контексте вызова)',
+                  boost: 10
+                });
+              } else if (existing.boost !== 10) {
+                // Повышаем приоритет существующего метода
+                existing.boost = 10;
+                existing.info = 'Метод из вашего кода (в контексте вызова)';
+              }
+            });
+          }
+          
           // Фильтруем по текущему слову
-          const wordLower = word.text.toLowerCase();
           const filtered = suggestions.filter(s => 
             s.label.toLowerCase().startsWith(wordLower)
           );
+          
+          // Сортируем: сниппеты и методы в контексте - выше
+          filtered.sort((a, b) => {
+            if (a.type === 'snippet') return -1;
+            if (b.type === 'snippet') return 1;
+            if (a.boost && !b.boost) return -1;
+            if (!a.boost && b.boost) return 1;
+            return 0;
+          });
           
           if (filtered.length === 0) return null;
           
@@ -1780,13 +1908,1421 @@ function App() {
           };
         }
       ]
-    });
-  }, [code, language, languageKeywords]); // Пересоздаем при изменении кода или языка
+      }),
+      customCompletionKeymap // Добавляем кастомный keymap для Tab
+    ];
+  }, [code, language, languageKeywords, customCompletionKeymap]); // Пересоздаем при изменении кода или языка
 
   // Расширение для табуляции
   const tabExtension = useMemo(() => {
     return EditorState.tabSize.of(tabSize);
   }, [tabSize]);
+
+  // Преобразует File изображения в data URL формата PNG или JPEG для надёжной вставки
+  const imageFileToDataUrl = useCallback((file, callback) => {
+    const mime = (file.type || '').toLowerCase();
+    const isJpeg = mime === 'image/jpeg' || mime === 'image/jpg';
+    const isPng = mime === 'image/png';
+    if (isJpeg || isPng) {
+      const reader = new FileReader();
+      reader.onload = (e) => callback(e.target.result);
+      reader.readAsDataURL(file);
+      return;
+    }
+    // Остальные форматы (webp, bmp и т.д.) конвертируем в PNG через canvas
+    const img = new Image();
+    const objectUrl = URL.createObjectURL(file);
+    img.onload = () => {
+      URL.revokeObjectURL(objectUrl);
+      try {
+        const canvas = document.createElement('canvas');
+        canvas.width = img.naturalWidth;
+        canvas.height = img.naturalHeight;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0);
+        const dataUrl = canvas.toDataURL('image/png');
+        callback(dataUrl);
+      } catch (err) {
+        const reader = new FileReader();
+        reader.onload = (e) => callback(e.target.result);
+        reader.readAsDataURL(file);
+      }
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      const reader = new FileReader();
+      reader.onload = (e) => callback(e.target.result);
+      reader.readAsDataURL(file);
+    };
+    img.src = objectUrl;
+  }, []);
+
+  // Вспомогательная функция для проверки типа файла по base64 строке
+  const checkBase64FileType = useCallback((base64Str) => {
+    try {
+      const decoded = atob(base64Str.substring(0, 20));
+      const bytes = new Uint8Array(decoded.length);
+      for (let i = 0; i < decoded.length; i++) {
+        bytes[i] = decoded.charCodeAt(i);
+      }
+      
+      // ZIP signature: 50 4B (PK) - это не изображение
+      if (bytes[0] === 0x50 && bytes[1] === 0x4B) {
+        return null; // ZIP файл, не изображение
+      }
+      
+      // PNG signature: 89 50 4E 47
+      if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47) {
+        return 'png';
+      }
+      // JPEG signature: FF D8 FF
+      if (bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF) {
+        return 'jpeg';
+      }
+      // GIF signature: 47 49 46 38
+      if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x38) {
+        return 'gif';
+      }
+      // WebP signature: RIFF...WEBP
+      if (bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46) {
+        return 'webp';
+      }
+      
+      return null; // Неизвестный формат
+    } catch (e) {
+      return null; // Ошибка декодирования
+    }
+  }, []);
+
+  // Извлечение изображений из base64-encoded ZIP (Office пакет)
+  const extractImagesFromZipBase64 = useCallback(async (base64Str, logFiles = false) => {
+    try {
+      const binary = atob(base64Str);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      const zip = await JSZip.loadAsync(bytes);
+      const fileNames = [];
+      zip.forEach((path) => { fileNames.push(path); });
+      if (logFiles && fileNames.length > 0) {
+        console.log('Содержимое ZIP:', fileNames.join(', '), `(всего ${fileNames.length} файлов)`);
+      }
+      const promises = [];
+      
+      // Обрабатываем все файлы в ZIP
+      zip.forEach((path, file) => {
+        if (file.dir) return;
+        
+        const fileName = path.split('/').pop() || path.split('\\').pop() || path;
+        const isImageExt = /\.(png|jpe?g|gif|webp|emf|wmf)$/i.test(fileName);
+        const isImageName = /^(image|clip_image|drawing|pic|photo|img)\d*\.(png|jpe?g|gif|webp)/i.test(fileName);
+        const isImagePath = /word[\/\\]media|media[\/\\]|drawings?[\/\\]|clipboard[\/\\]|image|\.(png|jpe?g|gif|webp)/i.test(path);
+        const isXml = /\.xml$/i.test(fileName);
+        const isRels = /\.rels$/i.test(fileName) || path.indexOf('[Content_Types]') !== -1 || path.indexOf('_rels') !== -1;
+        const hasNoExt = !fileName.includes('.') || fileName.split('.').length === 1;
+        
+        if (logFiles) {
+          console.log(`Файл в ZIP: ${path}, расширение: ${isImageExt}, имя: ${isImageName}, путь: ${isImagePath}, XML: ${isXml}, без расширения: ${hasNoExt}`);
+        }
+        
+        // Если это изображение по расширению или имени
+        if (isImageExt || isImageName) {
+          promises.push(file.async('base64').then(base64 => {
+            const ext = (fileName.match(/\.(png|jpe?g|gif|webp|emf|wmf)$/i) || [])[1] || '';
+            if (/emf|wmf/i.test(ext)) return null;
+            let type = 'png';
+            if (/jpe?g/i.test(ext)) type = 'jpeg';
+            else if (/gif/i.test(ext)) type = 'gif';
+            else if (/webp/i.test(ext)) type = 'webp';
+            if (logFiles) console.log(`Найдено изображение в ZIP: ${path} (${type})`);
+            return `![image](data:image/${type};base64,${base64})`;
+          }));
+        }
+        // Если это XML файл - проверяем на наличие base64 изображений внутри
+        else if (isXml && !isRels) {
+          promises.push(file.async('string').then(xmlContent => {
+            if (logFiles && path.includes('drawing')) {
+              console.log(`Проверяем XML файл: ${path}, размер: ${xmlContent.length}`);
+              console.log(`Первые 500 символов XML: ${xmlContent.substring(0, 500)}`);
+            }
+            // Ищем base64 изображения в XML (разные паттерны)
+            const found = [];
+            
+            // Паттерн 1: прямой base64 в атрибутах или тексте
+            const base64Matches = xmlContent.match(/[A-Za-z0-9+/=\s]{500,}/g);
+            if (base64Matches) {
+              base64Matches.forEach((base64Str) => {
+                const cleanBase64 = base64Str.replace(/[\s\n\r\t]+/g, '');
+                if (cleanBase64.length > 500 && /^[A-Za-z0-9+/=]+$/.test(cleanBase64)) {
+                  const imageType = checkBase64FileType(cleanBase64);
+                  if (imageType) {
+                    if (logFiles) console.log(`Найдено изображение в XML ${path}: ${imageType}, длина=${cleanBase64.length}`);
+                    found.push(`![image](data:image/${imageType};base64,${cleanBase64})`);
+                  }
+                }
+              });
+            }
+            
+            // Паттерн 2: r:embed или o:relid с последующими данными
+            // Паттерн 3: w:binData элементы
+            const binDataMatches = xmlContent.match(/<w:binData[^>]*>([A-Za-z0-9+/=\s]+)<\/w:binData>/gi);
+            if (binDataMatches) {
+              binDataMatches.forEach(match => {
+                const base64Match = match.match(/>([A-Za-z0-9+/=\s]+)</);
+                if (base64Match) {
+                  const cleanBase64 = base64Match[1].replace(/[\s\n\r\t]+/g, '');
+                  if (cleanBase64.length > 100) {
+                    const imageType = checkBase64FileType(cleanBase64);
+                    if (imageType) {
+                      if (logFiles) console.log(`Найдено w:binData изображение в XML ${path}: ${imageType}, длина=${cleanBase64.length}`);
+                      found.push(`![image](data:image/${imageType};base64,${cleanBase64})`);
+                    }
+                  }
+                }
+              });
+            }
+            
+            // Паттерн 4: v:imagedata с src или o:href содержащими base64
+            const vImageMatches = xmlContent.match(/<v:imagedata[^>]*(?:src|o:href)=["']([^"']+)["'][^>]*>/gi);
+            if (vImageMatches) {
+              vImageMatches.forEach(match => {
+                const srcMatch = match.match(/(?:src|o:href)=["']([^"']+)["']/);
+                if (srcMatch && srcMatch[1].startsWith('data:image')) {
+                  const dataUrlMatch = srcMatch[1].match(/data:image\/([^;]+);base64,([A-Za-z0-9+/=]+)/);
+                  if (dataUrlMatch) {
+                    if (logFiles) console.log(`Найдено v:imagedata с data:image в XML ${path}: ${dataUrlMatch[1]}`);
+                    found.push(`![image](${srcMatch[1]})`);
+                  }
+                }
+              });
+            }
+            
+            if (logFiles && path.includes('drawing') && found.length === 0) {
+              console.log(`В XML ${path} не найдено изображений. Всего base64 совпадений: ${base64Matches ? base64Matches.length : 0}`);
+            }
+            
+            return found;
+          }).then(arr => arr));
+        }
+        // Если путь указывает на изображение, но нет расширения - проверяем содержимое
+        else if (isImagePath && !isXml && !isRels) {
+          promises.push(file.async('base64').then(base64 => {
+            // Проверяем первые байты для определения типа
+            try {
+              const decoded = atob(base64.substring(0, 20));
+              const bytes = new Uint8Array(decoded.length);
+              for (let i = 0; i < decoded.length; i++) bytes[i] = decoded.charCodeAt(i);
+              
+              let type = null;
+              if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47) type = 'png';
+              else if (bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF) type = 'jpeg';
+              else if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x38) type = 'gif';
+              else if (bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46) type = 'webp';
+              
+              if (type) {
+                if (logFiles) console.log(`Найдено изображение в ZIP (по содержимому): ${path} (${type})`);
+                return `![image](data:image/${type};base64,${base64})`;
+              }
+            } catch (_) {}
+            return null;
+          }));
+        }
+        // Проверяем файлы без расширения или с неизвестным расширением в clipboard папке
+        else if (!isXml && !isRels && (hasNoExt || path.includes('clipboard'))) {
+          promises.push(file.async('base64').then(base64 => {
+            // Проверяем первые байты для определения типа изображения
+            try {
+              if (base64.length < 20) return null;
+              const decoded = atob(base64.substring(0, 20));
+              const bytes = new Uint8Array(decoded.length);
+              for (let i = 0; i < decoded.length; i++) bytes[i] = decoded.charCodeAt(i);
+              
+              let type = null;
+              if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47) type = 'png';
+              else if (bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF) type = 'jpeg';
+              else if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x38) type = 'gif';
+              else if (bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46) type = 'webp';
+              
+              if (type) {
+                if (logFiles) console.log(`Найдено изображение в ZIP (файл без расширения): ${path} (${type}), размер=${base64.length}`);
+                return `![image](data:image/${type};base64,${base64})`;
+              }
+            } catch (_) {}
+            return null;
+          }));
+        }
+        // Проверяем ВСЕ остальные файлы в ZIP (кроме XML и rels) - может быть изображения с нестандартными именами
+        else if (!isXml && !isRels && !isImageExt && !isImageName && !isImagePath) {
+          // Проверяем только файлы определенного размера (изображения обычно больше 1KB)
+          promises.push(file.async('base64').then(base64 => {
+            if (base64.length < 1000) return null; // Пропускаем слишком маленькие файлы
+            
+            // Проверяем первые байты для определения типа изображения
+            try {
+              if (base64.length < 20) return null;
+              const decoded = atob(base64.substring(0, 20));
+              const bytes = new Uint8Array(decoded.length);
+              for (let i = 0; i < decoded.length; i++) bytes[i] = decoded.charCodeAt(i);
+              
+              let type = null;
+              if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47) type = 'png';
+              else if (bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF) type = 'jpeg';
+              else if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x38) type = 'gif';
+              else if (bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46) type = 'webp';
+              
+              if (type) {
+                if (logFiles) console.log(`Найдено изображение в ZIP (нестандартное имя): ${path} (${type}), размер=${base64.length}`);
+                return `![image](data:image/${type};base64,${base64})`;
+              }
+            } catch (_) {}
+            return null;
+          }));
+        }
+      });
+      
+      const results = await Promise.all(promises);
+      return results.flat().filter(Boolean);
+    } catch (err) {
+      console.warn('Ошибка извлечения из ZIP:', err);
+      return [];
+    }
+  }, [checkBase64FileType]);
+
+  // Расширение для обработки вставки текста и изображений из буфера обмена (включая Word)
+  // Используем ViewPlugin для прямого доступа к DOM событию
+  const pasteHandler = useMemo(() => {
+    return ViewPlugin.fromClass(class {
+      constructor(view) {
+        this.view = view;
+        this.pasteHandler = (e) => {
+          console.log('=== PASTE EVENT (ViewPlugin) ===');
+          const clipboardData = e.clipboardData;
+          if (!clipboardData) {
+            console.log('✗ Нет clipboardData в ViewPlugin обработчике');
+            return; // Позволяем стандартную обработку
+          }
+          
+          console.log('✓ clipboardData существует в ViewPlugin');
+          
+          const items = Array.from(clipboardData.items || []);
+          console.log(`Найдено items в clipboard: ${items.length}`);
+          items.forEach((item, idx) => {
+            console.log(`  Item ${idx}: type=${item.type}`);
+          });
+          
+          const imageItem = items.find(item => {
+            const t = (item.type || '').toLowerCase();
+            return t === 'image/png' || t === 'image/jpeg' || t === 'image/jpg' || t.startsWith('image/');
+          });
+          
+          if (imageItem) {
+            console.log('✓ Найдено изображение в items, обрабатываем...');
+            const file = imageItem.getAsFile();
+            if (!file) return;
+            e.preventDefault();
+            imageFileToDataUrl(file, (imageDataUrl) => {
+              if (!imageDataUrl) return;
+              const imageMarkdown = `![image](${imageDataUrl})\n`;
+              const selection = view.state.selection.main;
+              view.dispatch({
+                changes: { from: selection.from, to: selection.to, insert: imageMarkdown },
+                selection: { anchor: selection.from + imageMarkdown.length }
+              });
+            });
+            return;
+          }
+          
+          // Пытаемся получить HTML из буфера (для Word документов с картинками)
+          const htmlData = clipboardData.getData('text/html');
+          const plainTextFallback = clipboardData.getData('text/plain') || '';
+          
+          console.log(`HTML данные: ${htmlData ? `есть (${htmlData.length} символов)` : 'нет'}`);
+          console.log(`Plain text: ${plainTextFallback ? `есть (${plainTextFallback.length} символов)` : 'нет'}`);
+          
+          if (htmlData && htmlData.length > 0) {
+            e.preventDefault(); // Блокируем стандартную вставку сразу
+            const selection = view.state.selection.main;
+            let imageCount = 0;
+            const foundImages = [];
+            
+            console.log(`=== НАЧАЛО ОБРАБОТКИ HTML ===`);
+            console.log(`Размер htmlData: ${htmlData.length} символов`);
+            console.log(`Размер plainTextFallback: ${plainTextFallback ? plainTextFallback.length : 0} символов`);
+            // Проверяем, есть ли в HTML упоминания изображений
+            const hasImgTags = /<img[^>]+>/i.test(htmlData);
+            const hasDataImage = /data:image\//i.test(htmlData);
+            const hasBase64 = /base64/i.test(htmlData);
+            console.log(`HTML содержит: img теги=${hasImgTags}, data:image=${hasDataImage}, base64=${hasBase64}`);
+            
+            // Выводим небольшой фрагмент HTML для анализа структуры
+            const htmlSample = htmlData.substring(0, Math.min(5000, htmlData.length));
+            console.log(`Фрагмент HTML (первые 5000 символов):`, htmlSample);
+            
+            // Ищем любые упоминания изображений или base64 в начале HTML
+            const base64SampleMatches = htmlSample.match(/[A-Za-z0-9+/=]{100,}/g);
+            if (base64SampleMatches) {
+              console.log(`Найдено потенциальных base64 фрагментов в начале HTML: ${base64SampleMatches.length}`);
+              base64SampleMatches.slice(0, 3).forEach((match, idx) => {
+                console.log(`  Base64 фрагмент ${idx + 1}: длина=${match.length}, начало=${match.substring(0, 50)}...`);
+              });
+            }
+            
+            // Извлекаем текст для вставки. Word в HTML кладёт стили/CSS — при наличии text/plain используем его.
+            let plainText = plainTextFallback; // Начинаем с fallback (чистый текст из буфера)
+            try {
+              const tempDiv = document.createElement('div');
+              tempDiv.innerHTML = htmlData;
+              const extractedText = tempDiv.textContent || tempDiv.innerText || '';
+              const hasWordCssJunk = /\/\*|@font-face|mso-|Style Definitions|Font Definitions/.test(extractedText);
+              const fallbackShorter = plainTextFallback && extractedText.length > plainTextFallback.length * 2;
+              // Если в извлечённом тексте мусор Word/CSS или он сильно длиннее plain — вставляем чистый text/plain
+              if (extractedText && extractedText.trim().length > 0 && !hasWordCssJunk && !fallbackShorter) {
+                plainText = extractedText;
+              }
+            } catch (err) {
+              console.warn('Ошибка извлечения текста из HTML:', err);
+            }
+            
+            if (!plainText || plainText.length === 0) {
+              plainText = plainTextFallback || ' ';
+            }
+            
+            // Порядок «текст — картинка» по позициям clip_image в HTML (Word часто кладёт картинки в конец, по позициям порядок верный)
+            const getContentOrderByImagePositions = (html) => {
+              const items = [];
+              try {
+                const re = /clip_image(\d+)\.(png|jpg|jpeg|gif)/gi;
+                const seen = new Set();
+                const imageOrder = [];
+                let m;
+                while ((m = re.exec(html)) !== null) {
+                  const name = m[0];
+                  if (seen.has(name)) continue;
+                  seen.add(name);
+                  imageOrder.push({ name, index: m.index });
+                }
+                if (imageOrder.length === 0) return [];
+                let bodyStart = 0;
+                const bodyMatch = html.match(/<body[^>]*>/i);
+                if (bodyMatch) {
+                  const idx = html.indexOf(bodyMatch[0]);
+                  bodyStart = idx + bodyMatch[0].length;
+                }
+                const tempDiv = document.createElement('div');
+                for (let i = 0; i < imageOrder.length; i++) {
+                  const segStart = i === 0 ? bodyStart : imageOrder[i - 1].index + imageOrder[i - 1].name.length;
+                  const segEnd = imageOrder[i].index;
+                  const segmentHtml = html.substring(segStart, segEnd);
+                  tempDiv.innerHTML = segmentHtml;
+                  const text = (tempDiv.innerText || tempDiv.textContent || '').trim();
+                  if (text.length > 0) items.push({ type: 'text', content: text });
+                  items.push({ type: 'image', name: imageOrder[i].name });
+                }
+                const lastSegStart = imageOrder[imageOrder.length - 1].index + imageOrder[imageOrder.length - 1].name.length;
+                const lastSegmentHtml = html.substring(lastSegStart);
+                tempDiv.innerHTML = lastSegmentHtml;
+                const lastText = (tempDiv.innerText || tempDiv.textContent || '').trim();
+                if (lastText.length > 0) items.push({ type: 'text', content: lastText });
+              } catch (err) {
+                console.warn('getContentOrderByImagePositions:', err);
+              }
+              return items;
+            };
+            
+            const getContentOrder = (html) => {
+              const items = [];
+              const paragraphTags = ['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'blockquote', 'pre', 'td', 'th'];
+              try {
+                const div = document.createElement('div');
+                div.innerHTML = html;
+                const body = div.querySelector('body') || div.querySelector('html') || div;
+                const skipTags = ['script', 'style', 'meta', 'link', 'title'];
+                function walk(node) {
+                  if (!node) return;
+                  if (node.nodeType === Node.TEXT_NODE) {
+                    const t = (node.textContent || '').trim();
+                    if (t.length > 0) items.push({ type: 'text', content: t });
+                    return;
+                  }
+                  if (node.nodeType !== Node.ELEMENT_NODE) return;
+                  const tag = (node.tagName || '').toLowerCase();
+                  if (skipTags.includes(tag)) return;
+                  if (tag === 'br') {
+                    if (items.length > 0) items.push({ type: 'linebreak' });
+                    return;
+                  }
+                  const src = node.getAttribute('src') || node.getAttribute('o:href') || '';
+                  const imgMatch = src.match(/clip_image\d+\.(png|jpg|jpeg|gif)/i);
+                  if (imgMatch) {
+                    items.push({ type: 'image', name: imgMatch[0] });
+                    return;
+                  }
+                  if (tag.indexOf('imagedata') !== -1) {
+                    const s = node.getAttribute('src') || node.getAttribute('o:href') || (node.outerHTML || '');
+                    const m = s.match(/clip_image\d+\.(png|jpg|jpeg|gif)/i);
+                    if (m) items.push({ type: 'image', name: m[0] });
+                    return;
+                  }
+                  const isParagraph = paragraphTags.includes(tag) || tag === 'p' || tag.endsWith(':p');
+                  if (isParagraph) {
+                    const blockText = (node.innerText || node.textContent || '').trim();
+                    if (blockText.length > 0) {
+                      items.push({ type: 'text', content: blockText });
+                    }
+                    return;
+                  }
+                  for (let i = 0; i < node.childNodes.length; i++) {
+                    walk(node.childNodes[i]);
+                  }
+                }
+                walk(body);
+              } catch (err) {
+                console.warn('getContentOrder:', err);
+              }
+              return items;
+            };
+            
+            const buildInterleavedContent = (contentOrder, imageByName, fallbackText) => {
+              if (!contentOrder.length || Object.keys(imageByName).length === 0) return null;
+              const imageItems = contentOrder.filter(it => it.type === 'image');
+              const textLengths = [];
+              let idx = 0;
+              while (idx < contentOrder.length) {
+                let segLen = 0;
+                while (idx < contentOrder.length && contentOrder[idx].type !== 'image') {
+                  if (contentOrder[idx].type === 'text') segLen += contentOrder[idx].content.length;
+                  else if (contentOrder[idx].type === 'linebreak') segLen += 2;
+                  idx++;
+                }
+                textLengths.push(segLen);
+                if (idx < contentOrder.length && contentOrder[idx].type === 'image') idx++;
+              }
+              const totalTextLen = textLengths.reduce((a, b) => a + b, 0) || 1;
+              const numImages = imageItems.length;
+              if (numImages === 0) return null;
+              if (fallbackText && fallbackText.length > 10 && textLengths.length >= numImages + 1) {
+                const plainLen = fallbackText.length;
+                const findBoundary = (str, targetIdx) => {
+                  if (targetIdx <= 0) return 0;
+                  if (targetIdx >= str.length) return str.length;
+                  let best = targetIdx;
+                  let bestDist = Infinity;
+                  for (let pos = targetIdx; pos >= Math.max(0, targetIdx - 500); pos--) {
+                    if (pos === 0 || str[pos - 1] === '\n') {
+                      const d = Math.abs(pos - targetIdx);
+                      if (d < bestDist) { bestDist = d; best = pos; }
+                      break;
+                    }
+                  }
+                  for (let pos = targetIdx; pos <= Math.min(str.length, targetIdx + 500); pos++) {
+                    if (pos === str.length || str[pos] === '\n') {
+                      const d = Math.abs(pos - targetIdx);
+                      if (d < bestDist) { bestDist = d; best = pos; }
+                      break;
+                    }
+                  }
+                  return best;
+                };
+                let cum = 0;
+                const splitPositions = [0];
+                for (let k = 0; k < numImages; k++) {
+                  cum += textLengths[k];
+                  const target = Math.round((cum / totalTextLen) * plainLen);
+                  splitPositions.push(findBoundary(fallbackText, target));
+                }
+                splitPositions.push(plainLen);
+                const parts = [];
+                for (let k = 0; k < numImages; k++) {
+                  parts.push(fallbackText.substring(splitPositions[k], splitPositions[k + 1]));
+                  const dataUrl = imageByName[imageItems[k].name];
+                  if (dataUrl) parts.push(`\n\n![image](${dataUrl})\n\n`);
+                }
+                parts.push(fallbackText.substring(splitPositions[numImages], splitPositions[numImages + 1]));
+                return parts.join('').replace(/\n{3,}/g, '\n\n').trim();
+              }
+              const parts = [];
+              let currentText = [];
+              let hasImages = false;
+              const flushText = () => {
+                if (currentText.length > 0) {
+                  parts.push(currentText.join('\n\n'));
+                  currentText = [];
+                }
+              };
+              for (const item of contentOrder) {
+                if (item.type === 'text') {
+                  currentText.push(item.content);
+                } else if (item.type === 'linebreak') {
+                  flushText();
+                  parts.push('\n\n');
+                } else if (item.type === 'image' && imageByName[item.name]) {
+                  flushText();
+                  parts.push(`\n\n![image](${imageByName[item.name]})\n\n`);
+                  hasImages = true;
+                }
+              }
+              flushText();
+              if (!hasImages) return null;
+              return parts.join('').replace(/\n{3,}/g, '\n\n').trim();
+            };
+            
+            // 1. Обрабатываем обычные img теги с data:image - проверяем ВСЕ атрибуты
+            // Сначала через regex для быстрого поиска
+            try {
+              const imageMatches = htmlData.match(/<img[^>]+>/gi);
+              if (imageMatches) {
+                console.log(`Найдено img тегов: ${imageMatches.length}`);
+                imageMatches.forEach((imgTag) => {
+                  // Проверяем все возможные атрибуты: src, data-src, data-lazy-src, и т.д.
+                  const srcAttrs = ['src', 'data-src', 'data-lazy-src', 'data-original', 'data-url', 'xlink:href'];
+                  for (const attr of srcAttrs) {
+                    const srcMatch = imgTag.match(new RegExp(`${attr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}=["']([^"']+)["']`, 'i'));
+                    if (srcMatch && srcMatch[1]) {
+                      const src = srcMatch[1];
+                      if (src.startsWith('data:image')) {
+                        const cleanSrc = src.replace(/[\s\n\r\t]+/g, '');
+                        // Проверяем, не добавлено ли уже это изображение
+                        if (!foundImages.some(img => img.includes(cleanSrc))) {
+                          imageCount++;
+                          foundImages.push(`![image${imageCount}](${cleanSrc})`);
+                          console.log(`Найдено изображение в img теге (${attr}): ${cleanSrc.substring(0, 50)}...`);
+                        }
+                        break; // Нашли в этом теге, переходим к следующему
+                      }
+                    }
+                  }
+                });
+              }
+            } catch (err) {
+              console.warn('Ошибка обработки img тегов:', err);
+            }
+            
+            // 1.1. Также парсим HTML через DOM для поиска изображений во всех возможных местах
+            try {
+              const tempDiv = document.createElement('div');
+              tempDiv.innerHTML = htmlData;
+              
+              // Ищем все img элементы
+              const imgElements = tempDiv.querySelectorAll('img');
+              console.log(`Найдено img элементов через DOM: ${imgElements.length}`);
+              imgElements.forEach((imgEl) => {
+                const srcAttrs = ['src', 'data-src', 'data-lazy-src', 'data-original', 'data-url'];
+                for (const attr of srcAttrs) {
+                  const src = imgEl.getAttribute(attr);
+                  if (src && src.startsWith('data:image')) {
+                    const cleanSrc = src.replace(/[\s\n\r\t]+/g, '');
+                    if (!foundImages.some(img => img.includes(cleanSrc))) {
+                      imageCount++;
+                      foundImages.push(`![image${imageCount}](${cleanSrc})`);
+                      console.log(`Найдено изображение через DOM (${attr}): ${cleanSrc.substring(0, 50)}...`);
+                    }
+                    break;
+                  }
+                }
+              });
+              
+              // Ищем изображения в стилях элементов
+              const allElements = tempDiv.querySelectorAll('*');
+              allElements.forEach((el) => {
+                const style = el.getAttribute('style');
+                if (style) {
+                  const urlMatch = style.match(/url\(["']?([^"')]+)["']?\)/i);
+                  if (urlMatch && urlMatch[1]) {
+                    const url = urlMatch[1].trim();
+                    if (url.startsWith('data:image/')) {
+                      const cleanUrl = url.replace(/[\s\n\r\t]+/g, '');
+                      if (!foundImages.some(img => img.includes(cleanUrl))) {
+                        imageCount++;
+                        foundImages.push(`![image${imageCount}](${cleanUrl})`);
+                        console.log(`Найдено изображение в inline стиле: ${cleanUrl.substring(0, 50)}...`);
+                      }
+                    }
+                  }
+                }
+              });
+            } catch (err) {
+              console.warn('Ошибка парсинга HTML через DOM:', err);
+            }
+            
+            // 2. Ищем встроенные изображения в формате base64 в HTML (Word часто вставляет их так)
+            try {
+              // Более гибкий поиск: data:image с base64, может быть разбит на строки
+              const base64Matches = htmlData.match(/data:image\/[^;'"]+;base64,[A-Za-z0-9+/=\s\n\r\t]+/g);
+              if (base64Matches) {
+                console.log(`Найдено потенциальных base64 изображений: ${base64Matches.length}`);
+                base64Matches.forEach((base64Data, idx) => {
+                  const cleanData = base64Data.trim().replace(/[\s\n\r\t]+/g, '');
+                  if (cleanData.startsWith('data:image/') && cleanData.length > 100) {
+                    // Проверяем на дубликаты по началу base64 данных
+                    const isDuplicate = foundImages.some(img => {
+                      const imgBase64 = img.match(/data:image\/[^)]+/);
+                      if (!imgBase64) return false;
+                      const existingStart = imgBase64[0].substring(0, 200);
+                      const newStart = cleanData.substring(0, 200);
+                      return existingStart === newStart;
+                    });
+                    
+                    if (!isDuplicate) {
+                      imageCount++;
+                      foundImages.push(`![image${imageCount}](${cleanData})`);
+                      console.log(`Найдено base64 изображение ${imageCount}: ${cleanData.substring(0, 50)}... (длина: ${cleanData.length})`);
+                    }
+                  }
+                });
+              } else {
+                console.log('Не найдено совпадений с паттерном data:image/...;base64,...');
+              }
+            } catch (err) {
+              console.warn('Ошибка обработки base64 изображений:', err);
+            }
+            
+            // 2.1. Ищем изображения в стилях CSS (background-image: url(...))
+            try {
+              const styleMatches = htmlData.match(/background-image\s*:\s*url\(["']?([^"')]+)["']?\)/gi);
+              if (styleMatches) {
+                console.log(`Найдено потенциальных изображений в стилях: ${styleMatches.length}`);
+                styleMatches.forEach((styleMatch) => {
+                  const urlMatch = styleMatch.match(/url\(["']?([^"')]+)["']?\)/i);
+                  if (urlMatch && urlMatch[1]) {
+                    const url = urlMatch[1].trim();
+                    if (url.startsWith('data:image/')) {
+                      const cleanUrl = url.replace(/[\s\n\r\t]+/g, '');
+                      if (cleanUrl.length > 100 && !foundImages.some(img => img.includes(cleanUrl))) {
+                        imageCount++;
+                        foundImages.push(`![image${imageCount}](${cleanUrl})`);
+                        console.log(`Найдено изображение в стиле CSS: ${cleanUrl.substring(0, 50)}...`);
+                      }
+                    }
+                  }
+                });
+              }
+            } catch (err) {
+              console.warn('Ошибка поиска изображений в стилях:', err);
+            }
+            
+            // Используем Set для отслеживания уже обработанных base64 данных на уровне всей обработки HTML
+            // Это позволяет избежать дубликатов между разными методами поиска
+            const processedHashes = new Set();
+            // Список base64 строк, которые являются ZIP-архивами (Office пакеты) — из них извлечём изображения
+            const zipBase64List = [];
+            
+            // 2.2. Ищем любые длинные base64 строки (может быть без префикса data:image)
+            try {
+              // Ищем очень длинные base64 строки (более 1000 символов) - это могут быть изображения
+              // Более гибкий паттерн: base64 может быть разбит пробелами/переносами строк
+              const longBase64Pattern = /[A-Za-z0-9+/=\s\n\r\t]{1000,}/g;
+              const longBase64Matches = htmlData.match(longBase64Pattern);
+              if (longBase64Matches) {
+                console.log(`Найдено длинных base64 строк: ${longBase64Matches.length}`);
+                
+                longBase64Matches.forEach((base64Str, idx) => {
+                  // Очищаем от пробелов и переносов
+                  const cleanBase64 = base64Str.replace(/[\s\n\r\t]+/g, '');
+                  
+                  // Проверяем, что это действительно base64 (только допустимые символы)
+                  if (!/^[A-Za-z0-9+/=]+$/.test(cleanBase64)) {
+                    return; // Пропускаем, если содержит недопустимые символы
+                  }
+                  
+                  // Проверяем минимальную длину (изображения обычно больше 1000 символов)
+                  if (cleanBase64.length < 1000) {
+                    return; // Пропускаем слишком короткие строки
+                  }
+                  
+                  // Используем простой хеш всей строки для проверки дубликатов
+                  // Это более надежно, чем проверка по первым символам
+                  let hash = 0;
+                  const hashLength = Math.min(cleanBase64.length, 2000); // Хешируем первые 2000 символов для производительности
+                  for (let i = 0; i < hashLength; i++) {
+                    hash = ((hash << 5) - hash) + cleanBase64.charCodeAt(i);
+                    hash = hash & hash; // Convert to 32bit integer
+                  }
+                  
+                  // Также проверяем по длине и первым/последним символам для дополнительной проверки
+                  const lengthAndEnds = `${cleanBase64.length}_${cleanBase64.substring(0, 100)}_${cleanBase64.substring(cleanBase64.length - 100)}`;
+                  const uniqueId = `${hash}_${lengthAndEnds}`;
+                  
+                  if (processedHashes.has(uniqueId)) {
+                    return; // Уже обработали это изображение
+                  }
+                  processedHashes.add(uniqueId);
+                  
+                  // Пробуем определить тип изображения по началу base64 данных
+                  const imageType = checkBase64FileType(cleanBase64);
+                  if (!imageType) {
+                    // Может быть ZIP (Office пакет) — сохраняем для извлечения изображений
+                    try {
+                      const decoded = atob(cleanBase64.substring(0, 4));
+                      if (decoded.charCodeAt(0) === 0x50 && decoded.charCodeAt(1) === 0x4B) {
+                        zipBase64List.push(cleanBase64);
+                      }
+                    } catch (_) {}
+                    return;
+                  }
+                  
+                  imageCount++;
+                  foundImages.push(`![image${imageCount}](data:image/${imageType};base64,${cleanBase64})`);
+                  console.log(`Найдена длинная base64 строка ${imageCount} (изображение ${imageType}): длина=${cleanBase64.length}, первые символы: ${cleanBase64.substring(0, 50)}, последние: ${cleanBase64.substring(cleanBase64.length - 30)}`);
+                });
+                
+                console.log(`Обработано уникальных изображений из длинных base64 строк: ${foundImages.length} из ${longBase64Matches.length} найденных`);
+              } else {
+                console.log('Не найдено длинных base64 строк');
+              }
+            } catch (err) {
+              console.warn('Ошибка поиска длинных base64 строк:', err);
+            }
+            
+            // 2.3. Проверяем RTF формат (третий item в clipboard)
+            try {
+              const rtfData = clipboardData.getData('text/rtf');
+              if (rtfData && rtfData.length > 0) {
+                console.log(`RTF данные найдены: ${rtfData.length} символов`);
+                // RTF может содержать изображения в формате \pict или \bin
+                const rtfImageMatches = rtfData.match(/\\pict[^}]*/gi);
+                if (rtfImageMatches) {
+                  console.log(`Найдено \\pict блоков в RTF: ${rtfImageMatches.length}`);
+                }
+                
+                // Ищем base64 в RTF (RTF может содержать base64 изображения)
+                const rtfBase64Matches = rtfData.match(/[A-Za-z0-9+/=\s]{500,}/g);
+                if (rtfBase64Matches) {
+                  console.log(`Найдено потенциальных base64 строк в RTF: ${rtfBase64Matches.length}`);
+                  
+                  // Обрабатываем base64 из RTF аналогично HTML
+                  rtfBase64Matches.forEach((base64Str) => {
+                    const cleanBase64 = base64Str.replace(/[\s\n\r\t]+/g, '');
+                    
+                    if (!/^[A-Za-z0-9+/=]+$/.test(cleanBase64) || cleanBase64.length < 500) {
+                      return;
+                    }
+                    
+                    // Проверяем на дубликаты
+                    let hash = 0;
+                    const hashLength = Math.min(cleanBase64.length, 2000);
+                    for (let i = 0; i < hashLength; i++) {
+                      hash = ((hash << 5) - hash) + cleanBase64.charCodeAt(i);
+                      hash = hash & hash;
+                    }
+                    const lengthAndEnds = `${cleanBase64.length}_${cleanBase64.substring(0, 100)}_${cleanBase64.substring(cleanBase64.length - 100)}`;
+                    const uniqueId = `rtf_${hash}_${lengthAndEnds}`;
+                    
+                    if (processedHashes.has(uniqueId)) {
+                      return;
+                    }
+                    processedHashes.add(uniqueId);
+                    
+                    // Проверяем тип файла
+                    const imageType = checkBase64FileType(cleanBase64);
+                    if (imageType) {
+                      imageCount++;
+                      foundImages.push(`![image${imageCount}](data:image/${imageType};base64,${cleanBase64})`);
+                      console.log(`Найдено изображение в RTF (${imageType}): длина=${cleanBase64.length}`);
+                    } else {
+                      console.log(`Пропущена base64 строка из RTF (не изображение): первые символы: ${cleanBase64.substring(0, 50)}`);
+                    }
+                  });
+                } else {
+                  console.log('Не найдено base64 строк в RTF');
+                }
+              } else {
+                console.log('RTF данные отсутствуют или пусты');
+              }
+            } catch (err) {
+              console.warn('Ошибка обработки RTF:', err);
+            }
+            
+            // 2.5. Дополнительный поиск: ищем base64 в любых атрибутах и местах HTML
+            try {
+              const allBase64Matches = htmlData.match(/["']data:image\/[^"']+["']/gi);
+              if (allBase64Matches) {
+                allBase64Matches.forEach((match) => {
+                  const cleanMatch = match.replace(/["']/g, '');
+                  if (cleanMatch.startsWith('data:image') && cleanMatch.length > 100 && !foundImages.some(img => img.includes(cleanMatch))) {
+                    imageCount++;
+                    foundImages.push(`![image${imageCount}](${cleanMatch})`);
+                    console.log(`Найдено изображение в атрибуте: ${cleanMatch.substring(0, 50)}...`);
+                  }
+                });
+              }
+              
+              const unquotedMatches = htmlData.match(/data:image\/[^;\s<>]+;base64,[A-Za-z0-9+/=]{100,}/g);
+              if (unquotedMatches) {
+                unquotedMatches.forEach((match) => {
+                  const cleanMatch = match.trim();
+                  if (cleanMatch.length > 100 && !foundImages.some(img => img.includes(cleanMatch))) {
+                    imageCount++;
+                    foundImages.push(`![image${imageCount}](${cleanMatch})`);
+                    console.log(`Найдено изображение без кавычек: ${cleanMatch.substring(0, 50)}...`);
+                  }
+                });
+              }
+            } catch (err) {
+              console.warn('Ошибка дополнительного поиска base64:', err);
+            }
+            
+            // 3. Пытаемся найти изображения в формате w:binData (Word XML) и других XML форматах
+            try {
+              // Проверяем VML формат (v:imagedata) - часто используется в Word
+              // VML изображения могут быть в разных форматах:
+              // 1. Прямо в src как data:image
+              // 2. Через r:id связь на w:binData или другой элемент с base64
+              // 3. В связанных элементах после v:imagedata
+              const vmlImageMatches = htmlData.match(/<v:imagedata[^>]*>/gi);
+              if (vmlImageMatches) {
+                console.log(`Найдено v:imagedata элементов: ${vmlImageMatches.length}`);
+                
+                // Сначала собираем все r:id связи для поиска связанных данных
+                const relationshipMap = new Map();
+                const relationshipMatches = htmlData.match(/<Relationship[^>]*Id=["']([^"']+)["'][^>]*Target=["']([^"']+)["'][^>]*>/gi);
+                if (relationshipMatches) {
+                  relationshipMatches.forEach((rel) => {
+                    const idMatch = rel.match(/Id=["']([^"']+)["']/i);
+                    const targetMatch = rel.match(/Target=["']([^"']+)["']/i);
+                    if (idMatch && targetMatch) {
+                      relationshipMap.set(idMatch[1], targetMatch[1]);
+                    }
+                  });
+                  console.log(`Найдено связей (relationships): ${relationshipMap.size}`);
+                }
+                
+                vmlImageMatches.forEach((vmlImg, idx) => {
+                  // Логируем первые несколько элементов для отладки
+                  if (idx < 3) {
+                    console.log(`v:imagedata ${idx + 1}: ${vmlImg.substring(0, 200)}...`);
+                  }
+                  
+                  // Проверяем различные атрибуты, где могут быть изображения
+                  const srcMatch = vmlImg.match(/src=["']([^"']+)["']/i);
+                  const oHrefMatch = vmlImg.match(/o:href=["']([^"']+)["']/i);
+                  const rIdMatch = vmlImg.match(/r:id=["']([^"']+)["']/i);
+                  
+                  let imageSrc = null;
+                  
+                  if (srcMatch && srcMatch[1]) {
+                    imageSrc = srcMatch[1].trim();
+                  } else if (oHrefMatch && oHrefMatch[1]) {
+                    imageSrc = oHrefMatch[1].trim();
+                  } else if (rIdMatch && rIdMatch[1]) {
+                    // r:id указывает на связь, пытаемся найти соответствующий base64
+                    const relId = rIdMatch[1];
+                    const target = relationshipMap.get(relId);
+                    if (target) {
+                      console.log(`v:imagedata ${idx + 1}: r:id=${relId} -> target=${target}`);
+                      // Ищем элемент с этим target или связанный base64
+                      // Может быть в w:binData или другом месте
+                    } else {
+                      console.log(`v:imagedata ${idx + 1}: r:id=${relId} не найден в relationships`);
+                    }
+                    // Продолжаем поиск base64 данных в связанных элементах
+                  }
+                  
+                  if (imageSrc) {
+                    // Проверяем, является ли это data:image URL
+                    if (imageSrc.startsWith('data:image/')) {
+                      const cleanSrc = imageSrc.replace(/[\s\n\r\t]+/g, '');
+                      if (!foundImages.some(img => img.includes(cleanSrc))) {
+                        imageCount++;
+                        foundImages.push(`![image${imageCount}](${cleanSrc})`);
+                        console.log(`Найдено изображение в v:imagedata (data:image): ${cleanSrc.substring(0, 50)}...`);
+                      }
+                    } else if (imageSrc.includes('clip_image')) {
+                      // Это ссылка на временный файл Word, пытаемся найти соответствующие данные
+                      // Извлекаем имя файла (например, clip_image001.png)
+                      const fileNameMatch = imageSrc.match(/clip_image\d+\.(png|jpg|jpeg|gif)/i);
+                      if (fileNameMatch) {
+                        const fileName = fileNameMatch[0];
+                        console.log(`v:imagedata ${idx + 1}: найдена ссылка на ${fileName}, ищем данные...`);
+                        
+                        // Ищем base64 данные, которые могут быть связаны с этим файлом
+                        // Могут быть в ближайших элементах или в связанных данных
+                        const vmlImgIndex = htmlData.indexOf(vmlImg);
+                        if (vmlImgIndex !== -1) {
+                          // Ищем в области вокруг этого элемента (5000 символов до и после)
+                          const searchStart = Math.max(0, vmlImgIndex - 2000);
+                          const searchEnd = Math.min(htmlData.length, vmlImgIndex + vmlImg.length + 5000);
+                          const searchArea = htmlData.substring(searchStart, searchEnd);
+                          
+                          // Ищем base64 строки в этой области
+                          const nearbyBase64Matches = searchArea.match(/[A-Za-z0-9+/=\s]{500,}/g);
+                          if (nearbyBase64Matches) {
+                            nearbyBase64Matches.forEach((base64Str) => {
+                              const cleanBase64 = base64Str.replace(/[\s\n\r\t]+/g, '');
+                              if (cleanBase64.length > 500) {
+                                const imageType = checkBase64FileType(cleanBase64);
+                                if (imageType) {
+                                  // Проверяем на дубликаты
+                                  let hash = 0;
+                                  const hashLength = Math.min(cleanBase64.length, 2000);
+                                  for (let i = 0; i < hashLength; i++) {
+                                    hash = ((hash << 5) - hash) + cleanBase64.charCodeAt(i);
+                                    hash = hash & hash;
+                                  }
+                                  const lengthAndEnds = `${cleanBase64.length}_${cleanBase64.substring(0, 100)}_${cleanBase64.substring(cleanBase64.length - 100)}`;
+                                  const uniqueId = `vml_file_${hash}_${lengthAndEnds}`;
+                                  
+                                  if (!processedHashes.has(uniqueId)) {
+                                    processedHashes.add(uniqueId);
+                                    imageCount++;
+                                    foundImages.push(`![image${imageCount}](data:image/${imageType};base64,${cleanBase64})`);
+                                    console.log(`Найдено изображение для ${fileName} в v:imagedata ${idx + 1} (${imageType}): длина=${cleanBase64.length}`);
+                                  }
+                                }
+                              }
+                            });
+                          }
+                        }
+                      }
+                    } else {
+                      // Может быть относительный путь или другой формат
+                      console.log(`v:imagedata ${idx + 1}: src=${imageSrc.substring(0, Math.min(50, imageSrc.length))}... (не data:image)`);
+                    }
+                  }
+                  
+                  // Ищем base64 данные в следующем теге после v:imagedata
+                  // VML может хранить изображения в виде base64 в текстовом содержимом следующего элемента
+                  const vmlImgIndex = htmlData.indexOf(vmlImg);
+                  if (vmlImgIndex !== -1) {
+                    const afterVml = htmlData.substring(vmlImgIndex + vmlImg.length, vmlImgIndex + vmlImg.length + 500);
+                    const base64InNextTag = afterVml.match(/>([A-Za-z0-9+/=\s]{100,})</);
+                    if (base64InNextTag && base64InNextTag[1]) {
+                      const base64Data = base64InNextTag[1].trim().replace(/[\s\n\r]+/g, '');
+                      if (base64Data.length > 100) {
+                        const imageType = checkBase64FileType(base64Data);
+                        if (imageType) {
+                          // Проверяем на дубликаты
+                          let hash = 0;
+                          const hashLength = Math.min(base64Data.length, 2000);
+                          for (let i = 0; i < hashLength; i++) {
+                            hash = ((hash << 5) - hash) + base64Data.charCodeAt(i);
+                            hash = hash & hash;
+                          }
+                          const lengthAndEnds = `${base64Data.length}_${base64Data.substring(0, 100)}_${base64Data.substring(base64Data.length - 100)}`;
+                          const uniqueId = `vml_${hash}_${lengthAndEnds}`;
+                          
+                          if (!processedHashes.has(uniqueId)) {
+                            processedHashes.add(uniqueId);
+                            imageCount++;
+                            foundImages.push(`![image${imageCount}](data:image/${imageType};base64,${base64Data})`);
+                            console.log(`Найдено изображение в связанном элементе v:imagedata ${idx + 1} (${imageType}): длина=${base64Data.length}`);
+                          }
+                        }
+                      }
+                    }
+                  }
+                });
+              }
+              
+              // Ищем все упоминания clip_image файлов и пытаемся найти соответствующие данные
+              const clipImageMatches = htmlData.match(/clip_image\d+\.(png|jpg|jpeg|gif)/gi);
+              if (clipImageMatches) {
+                const uniqueClipImages = [...new Set(clipImageMatches)];
+                console.log(`Найдено уникальных упоминаний clip_image файлов: ${uniqueClipImages.length}`);
+                console.log(`Примеры: ${uniqueClipImages.slice(0, 5).join(', ')}`);
+                
+                // Для каждого упоминания ищем ближайшие base64 данные
+                uniqueClipImages.forEach((fileName, fileIdx) => {
+                  const fileNameRegex = new RegExp(fileName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+                  let match;
+                  while ((match = fileNameRegex.exec(htmlData)) !== null && fileIdx < 10) { // Ограничиваем поиск первыми 10 файлами для производительности
+                    const matchIndex = match.index;
+                    // Ищем base64 данные в области вокруг этого упоминания (3000 символов до и после)
+                    const searchStart = Math.max(0, matchIndex - 3000);
+                    const searchEnd = Math.min(htmlData.length, matchIndex + match[0].length + 3000);
+                    const searchArea = htmlData.substring(searchStart, searchEnd);
+                    
+                    // Ищем base64 строки в этой области
+                    const nearbyBase64Matches = searchArea.match(/[A-Za-z0-9+/=\s]{1000,}/g);
+                    if (nearbyBase64Matches) {
+                      nearbyBase64Matches.forEach((base64Str) => {
+                        const cleanBase64 = base64Str.replace(/[\s\n\r\t]+/g, '');
+                        if (cleanBase64.length > 1000) {
+                          const imageType = checkBase64FileType(cleanBase64);
+                          if (imageType) {
+                            // Проверяем на дубликаты
+                            let hash = 0;
+                            const hashLength = Math.min(cleanBase64.length, 2000);
+                            for (let i = 0; i < hashLength; i++) {
+                              hash = ((hash << 5) - hash) + cleanBase64.charCodeAt(i);
+                              hash = hash & hash;
+                            }
+                            const lengthAndEnds = `${cleanBase64.length}_${cleanBase64.substring(0, 100)}_${cleanBase64.substring(cleanBase64.length - 100)}`;
+                            const uniqueId = `clip_${hash}_${lengthAndEnds}`;
+                            
+                            if (!processedHashes.has(uniqueId)) {
+                              processedHashes.add(uniqueId);
+                              imageCount++;
+                              foundImages.push(`![image${imageCount}](data:image/${imageType};base64,${cleanBase64})`);
+                              console.log(`Найдено изображение для ${fileName} (${imageType}): длина=${cleanBase64.length}`);
+                            }
+                          }
+                        }
+                      });
+                    }
+                    break; // Обрабатываем только первое упоминание каждого файла
+                  }
+                });
+              }
+              
+              // Word XML формат
+              const binDataMatches = htmlData.match(/<w:binData[^>]*>([A-Za-z0-9+/=\s\n\r]+)<\/w:binData>/gi);
+              if (binDataMatches) {
+                console.log(`Найдено w:binData блоков: ${binDataMatches.length}`);
+                binDataMatches.forEach((binData) => {
+                  const dataMatch = binData.match(/>([A-Za-z0-9+/=\s\n\r]+)</);
+                  if (dataMatch && dataMatch[1]) {
+                    const base64Data = dataMatch[1].trim().replace(/[\s\n\r]+/g, '');
+                    if (base64Data.length > 100) {
+                      const imageType = checkBase64FileType(base64Data);
+                      if (imageType) {
+                        imageCount++;
+                        foundImages.push(`![image${imageCount}](data:image/${imageType};base64,${base64Data})`);
+                        console.log(`Найдено изображение в w:binData (${imageType}): длина=${base64Data.length}`);
+                      } else {
+                        console.log(`Пропущен w:binData блок (не изображение): длина=${base64Data.length}`);
+                      }
+                    }
+                  }
+                });
+              }
+              
+              // Другие возможные XML форматы с base64
+              const xmlBase64Matches = htmlData.match(/<[^>]+>([A-Za-z0-9+/=\s\n\r]{500,})<\/[^>]+>/gi);
+              if (xmlBase64Matches) {
+                console.log(`Найдено потенциальных XML блоков с base64: ${xmlBase64Matches.length}`);
+                xmlBase64Matches.forEach((xmlBlock) => {
+                  const dataMatch = xmlBlock.match(/>([A-Za-z0-9+/=\s\n\r]+)</);
+                  if (dataMatch && dataMatch[1]) {
+                    const base64Data = dataMatch[1].trim().replace(/[\s\n\r]+/g, '');
+                    // Проверяем, что это действительно base64 и достаточно длинное
+                    if (/^[A-Za-z0-9+/=]+$/.test(base64Data) && base64Data.length > 500 && !foundImages.some(img => img.includes(base64Data.substring(0, 100)))) {
+                      const imageType = checkBase64FileType(base64Data);
+                      if (imageType) {
+                        imageCount++;
+                        foundImages.push(`![image${imageCount}](data:image/${imageType};base64,${base64Data})`);
+                        console.log(`Найдено изображение в XML блоке (${imageType}): длина=${base64Data.length}`);
+                      } else {
+                        console.log(`Пропущен XML блок (не изображение): длина=${base64Data.length}`);
+                      }
+                    }
+                  }
+                });
+              }
+            } catch (err) {
+              console.warn('Ошибка обработки XML форматов:', err);
+            }
+            
+            // 3.1. Ищем base64 данные, которые могут быть разбиты на части (например, в атрибутах)
+            try {
+              // Ищем последовательности base64 символов, разделенные пробелами/переносами
+              // Это может быть base64, разбитый на строки для читаемости
+              const splitBase64Pattern = /(?:[A-Za-z0-9+/=]{50,}[\s\n\r\t]+){5,}[A-Za-z0-9+/=]{50,}/g;
+              const splitBase64Matches = htmlData.match(splitBase64Pattern);
+              if (splitBase64Matches) {
+                console.log(`Найдено разбитых base64 последовательностей: ${splitBase64Matches.length}`);
+                
+                // Используем тот же Set для проверки дубликатов
+                splitBase64Matches.forEach((splitBase64) => {
+                  const cleanBase64 = splitBase64.replace(/[\s\n\r\t]+/g, '');
+                  
+                  if (!/^[A-Za-z0-9+/=]+$/.test(cleanBase64) || cleanBase64.length < 1000) {
+                    return; // Пропускаем невалидные или слишком короткие
+                  }
+                  
+                  // Проверяем на дубликаты используя тот же метод
+                  let hash = 0;
+                  const hashLength = Math.min(cleanBase64.length, 2000);
+                  for (let i = 0; i < hashLength; i++) {
+                    hash = ((hash << 5) - hash) + cleanBase64.charCodeAt(i);
+                    hash = hash & hash;
+                  }
+                  const lengthAndEnds = `${cleanBase64.length}_${cleanBase64.substring(0, 100)}_${cleanBase64.substring(cleanBase64.length - 100)}`;
+                  const uniqueId = `${hash}_${lengthAndEnds}`;
+                  
+                  if (processedHashes.has(uniqueId)) {
+                    return; // Уже обработали
+                  }
+                  processedHashes.add(uniqueId);
+                  
+                  // Определяем тип изображения
+                  const imageType = checkBase64FileType(cleanBase64);
+                  if (!imageType) {
+                    console.log(`Пропущена разбитая base64 строка (не изображение)`);
+                    return; // Пропускаем не-изображения (ZIP, неизвестные форматы)
+                  }
+                  
+                  imageCount++;
+                  foundImages.push(`![image${imageCount}](data:image/${imageType};base64,${cleanBase64})`);
+                  console.log(`Найдено разбитое base64 изображение ${imageCount} (${imageType}): длина=${cleanBase64.length}`);
+                });
+                
+                console.log(`Обработано уникальных изображений из разбитых base64: ${foundImages.length} из ${splitBase64Matches.length} найденных`);
+              }
+            } catch (err) {
+              console.warn('Ошибка поиска разбитых base64:', err);
+            }
+            
+            // 4. Проверяем все элементы items на наличие изображений (PNG/JPEG или другие)
+            const imageFiles = [];
+            try {
+              items.forEach((item) => {
+                if (item.type.startsWith('image/') && !imageItem) {
+                  const file = item.getAsFile();
+                  if (file) {
+                    imageFiles.push(file);
+                  }
+                }
+              });
+            } catch (err) {
+              console.warn('Ошибка обработки items:', err);
+            }
+            
+            console.log(`HTML обработка: найдено изображений в HTML: ${foundImages.length}, в items: ${imageFiles.length}`);
+            console.log(`ZIP-архивов для извлечения: ${zipBase64List.length}`);
+            console.log(`Итого уникальных изображений после всех проверок: ${foundImages.length}`);
+            
+            // Проверяем, есть ли ссылки на clip_image файлы
+            const hasClipImageRefs = htmlData && /clip_image\d+\.(png|jpg|jpeg|gif)/gi.test(htmlData);
+            
+            // Обрабатываем изображения из items последовательно перед вставкой
+            const processImagesFromItems = (callback) => {
+              if (imageFiles.length === 0) {
+                callback();
+                return;
+              }
+              
+              let processedCount = 0;
+              const processNext = () => {
+                if (processedCount >= imageFiles.length) {
+                  callback();
+                  return;
+                }
+                
+                const file = imageFiles[processedCount];
+                imageFileToDataUrl(file, (imageDataUrl) => {
+                  if (imageDataUrl) {
+                    imageCount++;
+                    foundImages.push(`![image${imageCount}](${imageDataUrl})`);
+                    console.log(`Обработано изображение ${imageCount} из items: ${imageDataUrl.substring(0, 50)}...`);
+                  }
+                  processedCount++;
+                  processNext();
+                });
+              };
+              processNext();
+            };
+            
+            // Если есть ZIP-архивы — извлекаем из них изображения, затем вставляем
+            // prebuiltContent — если передан (текст+картинки в порядке из Word), вставляем его вместо plainText + images в конце
+            const doInsert = (prebuiltContent) => {
+              processImagesFromItems(() => {
+                const textToInsert = (prebuiltContent != null && prebuiltContent.length > 0)
+                  ? prebuiltContent
+                  : (plainText + (foundImages.length > 0 ? '\n\n' + foundImages.join('\n\n') : ''));
+              
+              console.log(`=== ВСТАВКА ===`);
+              console.log(`Длина textToInsert: ${textToInsert.length} символов`);
+              const imgCountInInsert = (textToInsert.match(/!\[[^\]]*\]\(data:image\/[^)]+\)/g) || []).length;
+              if (imgCountInInsert > 0) {
+                console.log(`Изображений в контенте: ${imgCountInInsert}`);
+              }
+              const imageMarkdownInText = (textToInsert.match(/!\[[^\]]*\]\(data:image\/[^)]+\)/g) || []).length;
+              console.log(`Проверка: найдено markdown изображений в textToInsert: ${imageMarkdownInText}`);
+              
+              const docLen = view.state.doc.length;
+              const from = Math.max(0, Math.min(selection.from, docLen));
+              const to = Math.max(from, Math.min(selection.to, docLen));
+              const insertPos = from + textToInsert.length;
+              
+              try {
+                view.dispatch({
+                  changes: {
+                    from,
+                    to,
+                    insert: textToInsert
+                  }
+                });
+                view.dispatch({
+                  selection: { anchor: Math.min(insertPos, view.state.doc.length) }
+                });
+                console.log(`✓ Успешно вставлено`);
+                setTimeout(() => {
+                  const insertedText = view.state.doc.sliceString(from, Math.min(from + textToInsert.length, view.state.doc.length));
+                  const imagesInDoc = (insertedText.match(/!\[[^\]]*\]\(data:image\/[^)]+\)/g) || []).length;
+                  console.log(`Проверка после вставки: найдено markdown изображений в документе: ${imagesInDoc}`);
+                }, 100);
+              } catch (err) {
+                console.error('✗ Ошибка вставки текста с изображениями:', err);
+                try {
+                  view.dispatch({
+                    changes: { from, to, insert: plainText }
+                  });
+                  view.dispatch({
+                    selection: { anchor: Math.min(from + plainText.length, view.state.doc.length) }
+                  });
+                  console.log('✓ Вставлен только текст (без изображений)');
+                } catch (err2) {
+                  console.error('✗ Критическая ошибка вставки текста:', err2);
+                }
+              }
+            });
+            }; // конец doInsert
+
+            // Функция для чтения изображений из папки Word (если они не найдены другими способами)
+            const tryReadWordClipImages = (callback) => {
+              if (foundImages.length === 0 && hasClipImageRefs && typeof ipcRenderer !== 'undefined' && ipcRenderer) {
+                console.log('Пробуем прочитать изображения из папки Word (Electron)...');
+                ipcRenderer.invoke('clipboard-get-word-clip-images').then((wordImages) => {
+                  if (wordImages && wordImages.length > 0) {
+                    const imageByName = {};
+                    wordImages.forEach(({ name, dataUrl }) => {
+                      imageByName[name] = dataUrl;
+                      imageCount++;
+                      foundImages.push(`![image](${dataUrl})`);
+                    });
+                    console.log(`✓ Загружено изображений из папки Word: ${wordImages.length}`);
+                    let contentOrder = getContentOrderByImagePositions(htmlData);
+                    if (contentOrder.length === 0) contentOrder = getContentOrder(htmlData);
+                    const interleaved = buildInterleavedContent(contentOrder, imageByName, plainText);
+                    if (interleaved != null && interleaved.length > 0) {
+                      console.log('✓ Используется порядок «текст — картинка» по позициям в HTML');
+                      callback(interleaved);
+                      return;
+                    }
+                  } else {
+                    console.log('⚠ Изображения не найдены в папке Word (возможно, файлы уже удалены)');
+                  }
+                  callback();
+                }).catch(err => {
+                  console.warn('Ошибка чтения изображений из папки Word:', err);
+                  callback();
+                });
+              } else {
+                callback();
+              }
+            };
+            
+            if (zipBase64List.length > 0) {
+              console.log(`Извлечение изображений из ${zipBase64List.length} ZIP-архивов...`);
+              Promise.all(zipBase64List.map((b64, idx) => extractImagesFromZipBase64(b64, idx < 3)))
+                .then(arrays => {
+                  const added = arrays.flat();
+                  added.forEach(md => { imageCount++; foundImages.push(md); });
+                  console.log(`Извлечено изображений из ZIP: ${added.length}`);
+                  if (added.length === 0 && zipBase64List.length > 0) {
+                    console.warn(`⚠ Не найдено изображений в ${zipBase64List.length} ZIP-архивах. Пробуем папку Word (Electron)...`);
+                  }
+                  // Если из ZIP ничего не извлекли — пробуем прочитать из временной папки Word
+                  tryReadWordClipImages(doInsert);
+                })
+                .catch(err => { console.warn('Ошибка извлечения из ZIP:', err); tryReadWordClipImages(doInsert); });
+            } else {
+              // Если нет ZIP-архивов, но есть ссылки на clip_image — пробуем прочитать из папки Word
+              tryReadWordClipImages(doInsert);
+            }
+            
+            return;
+          }
+          
+          // Если HTML нет, но есть plain text - пропускаем стандартную обработку
+          if (plainTextFallback && plainTextFallback.length > 0) {
+            console.log(`Есть plain text (${plainTextFallback.length} символов), пропускаем стандартную обработку`);
+            return; // Позволяем стандартную обработку
+          }
+          
+          // В Electron clipboardData.items часто пустой для картинок — читаем через API
+          if (ipcRenderer) {
+            e.preventDefault();
+            const selection = view.state.selection.main;
+            ipcRenderer.invoke('clipboard-get-image').then((dataUrl) => {
+              if (dataUrl && typeof dataUrl === 'string' && dataUrl.startsWith('data:image')) {
+                console.log('✓ Найдено изображение через Electron API');
+                const imageMarkdown = `![image](${dataUrl})\n`;
+                view.dispatch({
+                  changes: { from: selection.from, to: selection.to, insert: imageMarkdown },
+                  selection: { anchor: selection.from + imageMarkdown.length }
+                });
+              } else if (plainTextFallback) {
+                view.dispatch({
+                  changes: { from: selection.from, to: selection.to, insert: plainTextFallback },
+                  selection: { anchor: selection.from + plainTextFallback.length }
+                });
+              }
+            }).catch(() => {
+              if (plainTextFallback) {
+                view.dispatch({
+                  changes: { from: selection.from, to: selection.to, insert: plainTextFallback },
+                  selection: { anchor: selection.from + plainTextFallback.length }
+                });
+              }
+            });
+          }
+        };
+        
+        // Добавляем обработчик напрямую на DOM элемент редактора
+        view.dom.addEventListener('paste', this.pasteHandler, true);
+      }
+      
+      destroy() {
+        // Удаляем обработчик при уничтожении плагина
+        this.view.dom.removeEventListener('paste', this.pasteHandler, true);
+      }
+    });
+  }, [imageFileToDataUrl, checkBase64FileType, extractImagesFromZipBase64]);
+  
+  // Расширение для Tab - принимает автодополнение, если оно открыто, иначе вставляет табуляцию
+  // Используем Prec.high чтобы переопределить стандартный completionKeymap
+  const tabCompletionExtension = useMemo(() => {
+    return Prec.high(keymap.of([
+      {
+        key: 'Tab',
+        run: (view) => {
+          // Проверяем, открыто ли автодополнение - пробуем несколько способов
+          const tooltip = view.dom.querySelector('.cm-tooltip-autocomplete, .cm-tooltip[class*="autocomplete"]');
+          const isAutocompleteOpen = tooltip && (
+            tooltip.offsetParent !== null || 
+            tooltip.style.display !== 'none' ||
+            window.getComputedStyle(tooltip).display !== 'none'
+          );
+          
+          // Альтернативный способ - проверяем через состояние автодополнения
+          let completionActive = false;
+          try {
+            // Пытаемся получить состояние автодополнения
+            const state = view.state.field(autocompletion.State, false);
+            if (state && state.active) {
+              completionActive = true;
+            }
+          } catch (e) {
+            // Игнорируем ошибку, если поле не существует
+          }
+          
+          if (isAutocompleteOpen || completionActive) {
+            // Автодополнение открыто - принимаем его
+            const result = acceptCompletion(view);
+            if (result) return true;
+          }
+          
+          // Если автодополнение не открыто или не удалось принять, вставляем табуляцию
+          if (useSpaces) {
+            const spaces = ' '.repeat(tabSize);
+            view.dispatch({
+              changes: {
+                from: view.state.selection.main.from,
+                to: view.state.selection.main.to,
+                insert: spaces
+              },
+              selection: {
+                anchor: view.state.selection.main.from + spaces.length
+              }
+            });
+            return true;
+          }
+          // Если не useSpaces, позволяем стандартную обработку Tab
+          return false;
+        }
+      }
+    ]));
+  }, [useSpaces, tabSize]);
 
   // Расширение для использования пробелов вместо табов
   const indentExtension = useMemo(() => {
@@ -1811,24 +3347,8 @@ function App() {
             }
             return false;
           },
-          keydown(view, event) {
-            if (event.key === 'Tab' && !event.shiftKey) {
-              event.preventDefault();
-              const spaces = ' '.repeat(tabSize);
-              view.dispatch({
-                changes: {
-                  from: view.state.selection.main.from,
-                  to: view.state.selection.main.to,
-                  insert: spaces
-                },
-                selection: {
-                  anchor: view.state.selection.main.from + spaces.length
-                }
-              });
-              return true;
-            }
-            return false;
-          }
+          // Tab теперь обрабатывается в tabCompletionExtension
+          // Здесь оставляем только обработку beforeinput для табуляции через вставку текста
         })
       ];
     }
@@ -1867,6 +3387,188 @@ function App() {
         }
       }
     });
+  }, []);
+
+  // Состояние размеров картинок и расширение с виджетом (с возможностью тянуть за угол)
+  const imageExtensions = useMemo(() => {
+    const updateImageSizeEffect = StateEffect.define();
+    const imageSizesState = StateField.define({
+      create() { return new Map(); },
+      update(map, tr) {
+        let next = map;
+        for (const effect of tr.effects) {
+          if (effect.is(updateImageSizeEffect)) {
+            const { key, width, height } = effect.value;
+            next = new Map(next);
+            next.set(key, { width, height });
+          }
+        }
+        return next;
+      }
+    });
+
+    function simpleHash(str) {
+      let h = 0;
+      for (let i = 0; i < Math.min(str.length, 500); i++) h = ((h << 5) - h) + str.charCodeAt(i) | 0;
+      return String(h);
+    }
+
+    class ImageWidget extends WidgetType {
+      constructor(url, markdown, sizeKey, initialSize, onResize) {
+        super();
+        this.url = url;
+        this.markdown = markdown;
+        this.sizeKey = sizeKey;
+        this.initialSize = initialSize;
+        this.onResize = onResize;
+      }
+      toDOM() {
+        const container = document.createElement('span');
+        container.style.display = 'inline-block';
+        container.style.margin = '4px 0';
+        container.style.position = 'relative';
+        container.style.verticalAlign = 'middle';
+
+        const img = document.createElement('img');
+        img.src = this.url;
+        img.style.maxWidth = '800px';
+        img.style.maxHeight = '600px';
+        img.style.minWidth = '60px';
+        img.style.minHeight = '40px';
+        img.style.width = 'auto';
+        img.style.height = 'auto';
+        img.style.display = 'block';
+        img.style.borderRadius = '4px';
+        img.style.border = '1px solid #3e3e3e';
+        img.style.cursor = 'pointer';
+        img.style.backgroundColor = '#1e1e1e';
+        img.style.objectFit = 'contain';
+        if (this.initialSize && this.initialSize.width && this.initialSize.height) {
+          img.style.width = this.initialSize.width + 'px';
+          img.style.height = this.initialSize.height + 'px';
+        }
+
+        img.onclick = (e) => {
+          if (e.target === e.currentTarget || e.target === img) {
+            const w = window.open('', '_blank');
+            if (w) {
+              w.document.write(`<img src="${this.url}" style="max-width: 100%; height: auto;" />`);
+            }
+          }
+        };
+
+        img.onerror = () => {
+          img.style.display = 'none';
+          const error = document.createElement('span');
+          error.textContent = this.markdown;
+          error.style.color = '#888';
+          error.style.fontSize = '12px';
+          container.appendChild(error);
+        };
+
+        container.appendChild(img);
+
+        const handle = document.createElement('span');
+        handle.setAttribute('aria-hidden', 'true');
+        handle.style.position = 'absolute';
+        handle.style.right = '0';
+        handle.style.bottom = '0';
+        handle.style.width = '14px';
+        handle.style.height = '14px';
+        handle.style.background = 'linear-gradient(135deg, #4a9eff 0%, #4a9eff 100%)';
+        handle.style.border = '1px solid #2a6bb8';
+        handle.style.borderRadius = '2px';
+        handle.style.cursor = 'nwse-resize';
+        handle.style.zIndex = '2';
+        handle.style.boxSizing = 'border-box';
+        handle.title = 'Тяните за угол для изменения размера';
+        handle.onclick = (e) => e.stopPropagation();
+
+        let startX = 0, startY = 0, startW = 0, startH = 0;
+        const minW = 60, minH = 40, maxW = 1200, maxH = 900;
+
+        handle.addEventListener('mousedown', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          startX = e.clientX;
+          startY = e.clientY;
+          const r = img.getBoundingClientRect();
+          startW = r.width;
+          startH = r.height;
+          const onMove = (e2) => {
+            const dx = e2.clientX - startX;
+            const dy = e2.clientY - startY;
+            let w = Math.round(Math.max(minW, Math.min(maxW, startW + dx)));
+            let h = Math.round(Math.max(minH, Math.min(maxH, startH + dy)));
+            img.style.width = w + 'px';
+            img.style.height = h + 'px';
+            if (this.onResize) this.onResize(w, h);
+          };
+          const onUp = () => {
+            document.removeEventListener('mousemove', onMove);
+            document.removeEventListener('mouseup', onUp);
+          };
+          document.addEventListener('mousemove', onMove);
+          document.addEventListener('mouseup', onUp);
+        });
+
+        container.appendChild(handle);
+        return container;
+      }
+      ignoreEvent() {
+        return false;
+      }
+      eq(other) {
+        return other.url === this.url && other.sizeKey === this.sizeKey &&
+          (other.initialSize?.width === this.initialSize?.width && other.initialSize?.height === this.initialSize?.height);
+      }
+    }
+
+    const imageWidgetExtension = ViewPlugin.fromClass(class {
+      constructor(view) {
+        this.view = view;
+        this.decorations = this.buildDecorations(view);
+      }
+      update(update) {
+        if (update.docChanged || update.viewportChanged) {
+          this.decorations = this.buildDecorations(update.view);
+        } else if (update.stateChanged) {
+          const prev = update.startState.field(imageSizesState);
+          const next = update.state.field(imageSizesState);
+          if (prev !== next) this.decorations = this.buildDecorations(update.view);
+        }
+      }
+      buildDecorations(view) {
+        const decorations = [];
+        const text = view.state.doc.toString();
+        const imageRegex = /!\[([^\]]*)\]\(([^)]+)\)/g;
+        let match;
+        const sizes = view.state.field(imageSizesState);
+        while ((match = imageRegex.exec(text)) !== null) {
+          const url = match[2];
+          const fullMatch = match[0];
+          if (url && url.startsWith('data:image/')) {
+            const start = match.index;
+            const end = start + fullMatch.length;
+            const sizeKey = simpleHash(url);
+            const initialSize = sizes.get(sizeKey);
+            const onResize = (w, h) => view.dispatch({ effects: updateImageSizeEffect.of({ key: sizeKey, width: w, height: h }) });
+            decorations.push(
+              Decoration.replace({
+                widget: new ImageWidget(url, fullMatch, sizeKey, initialSize, onResize),
+                inclusive: true,
+                block: false
+              }).range(start, end)
+            );
+          }
+        }
+        return Decoration.set(decorations);
+      }
+    }, {
+      decorations: v => v.decorations,
+    });
+
+    return { imageSizesState, imageWidgetExtension };
   }, []);
 
   // Мини-карта кода (minimap) - отключаем пока, так как требует сложной реализации
@@ -2746,6 +4448,31 @@ function App() {
     }
     
     return formatted;
+  }, []);
+
+  // Функция для преобразования markdown изображений в HTML
+  const renderOutputWithImages = useCallback((text) => {
+    if (!text) return '';
+    // Сначала заменяем markdown изображения ![alt](url) на плейсхолдеры
+    const imageRegex = /!\[([^\]]*)\]\(([^)]+)\)/g;
+    const imagePlaceholders = [];
+    let html = text.replace(imageRegex, (match, alt, url) => {
+      const placeholder = `__IMAGE_PLACEHOLDER_${imagePlaceholders.length}__`;
+      // Экранируем URL и alt для безопасности
+      const safeUrl = url.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+      const safeAlt = (alt || '').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+      imagePlaceholders.push(`<img src="${safeUrl}" alt="${safeAlt}" style="max-width: 100%; height: auto; display: block; margin: 10px 0;" />`);
+      return placeholder;
+    });
+    // Теперь экранируем остальной HTML
+    html = html.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    // Заменяем переносы строк на <br>
+    html = html.replace(/\n/g, '<br>');
+    // Восстанавливаем изображения
+    imagePlaceholders.forEach((img, index) => {
+      html = html.replace(`__IMAGE_PLACEHOLDER_${index}__`, img);
+    });
+    return html;
   }, []);
 
   // По коду определяем, что это скорее всего Java (чтобы не применять к нему форматтер Python/других)
@@ -3749,6 +5476,83 @@ function App() {
     document.addEventListener('mousedown', handleMouseDown, true);
     return () => document.removeEventListener('mousedown', handleMouseDown, true);
   }, []);
+
+  // Глобальная вставка картинки из буфера (Electron): paste в редакторе часто не даёт clipboardData.items
+  // ВАЖНО: Этот обработчик работает ТОЛЬКО для изображений БЕЗ HTML/текста, чтобы не блокировать обработку HTML/текста
+  useEffect(() => {
+    if (!ipcRenderer) return;
+    const handlePaste = (e) => {
+      const el = document.activeElement;
+      if (!el?.closest?.('.cm-editor')) {
+        return; // Событие вне редактора, пропускаем
+      }
+      
+      const clipboardData = e.clipboardData;
+      if (!clipboardData) return;
+      
+      // Проверяем типы данных БЕЗ чтения содержимого
+      const htmlTypes = clipboardData?.types || [];
+      const hasHtmlType = htmlTypes.includes('text/html');
+      const hasTextType = htmlTypes.includes('text/plain');
+      
+      // Если есть HTML или текст - ПОЛНОСТЬЮ пропускаем событие, не трогаем его вообще
+      // Это позволяет CodeMirror обработать HTML/текст без вмешательства
+      if (hasHtmlType || hasTextType) {
+        return; // Полностью игнорируем, пусть CodeMirror обработает
+      }
+      
+      // Проверяем, есть ли изображение в clipboardData.items
+      const items = Array.from(clipboardData?.items || []);
+      const hasImageInItems = items.some(item => {
+        const t = (item.type || '').toLowerCase();
+        return t === 'image/png' || t === 'image/jpeg' || t === 'image/jpg' || t.startsWith('image/');
+      });
+      
+      // Если есть изображение в items - CodeMirror уже обработает его, не мешаем
+      if (hasImageInItems) {
+        return; // Позволяем CodeMirror обработать через pasteHandler
+      }
+      
+      // Только если НЕТ изображения в items И НЕТ HTML/текста - проверяем через Electron API
+      // (это случай когда в буфере только изображение без текста, например из скриншота)
+      let view = null;
+      if (editorViewRef.current?.dom?.contains(el)) view = editorViewRef.current;
+      else if (editorViewRef1.current?.dom?.contains(el)) view = editorViewRef1.current;
+      else if (editorViewRef2.current?.dom?.contains(el)) view = editorViewRef2.current;
+      if (!view?.state) return;
+      
+      const textFallback = clipboardData ? clipboardData.getData('text/plain') || '' : '';
+      
+      // Проверяем через Electron API только если нет данных в clipboardData
+      e.preventDefault();
+      e.stopPropagation();
+      ipcRenderer.invoke('clipboard-get-image').then((dataUrl) => {
+        const selection = view.state.selection.main;
+        if (dataUrl && typeof dataUrl === 'string' && dataUrl.startsWith('data:image')) {
+          const imageMarkdown = `![image](${dataUrl})\n`;
+          view.dispatch({
+            changes: { from: selection.from, to: selection.to, insert: imageMarkdown },
+            selection: { anchor: selection.from + imageMarkdown.length }
+          });
+        } else if (textFallback) {
+          view.dispatch({
+            changes: { from: selection.from, to: selection.to, insert: textFallback },
+            selection: { anchor: selection.from + textFallback.length }
+          });
+        }
+      }).catch(() => {
+        if (textFallback) {
+          const selection = view.state.selection.main;
+          view.dispatch({
+            changes: { from: selection.from, to: selection.to, insert: textFallback },
+            selection: { anchor: selection.from + textFallback.length }
+          });
+        }
+      });
+    };
+    document.addEventListener('paste', handlePaste, true);
+    return () => document.removeEventListener('paste', handlePaste, true);
+  }, [ipcRenderer]);
 
   // В SQL-режиме: таблицы обновляются ТОЛЬКО после выполнения запроса (executeCode1).
   // Динамическое обновление при вводе кода отключено по требованию пользователя —
@@ -4873,12 +6677,16 @@ function App() {
                     extensions={[
                       getLanguageExtension1(), 
                       customHighlightStyle,
-                      smartAutocomplete,
+                      ...smartAutocomplete,
                       tabExtension,
+                      tabCompletionExtension,
                       clickToDeselectExtension,
+                      pasteHandler,
                       ...indentExtension,
                       ...enhancedBracketMatching,
                       ...minimapExtension,
+                      imageExtensions.imageSizesState,
+                      imageExtensions.imageWidgetExtension,
                       highlightActiveLineGutter(),
                       highlightActiveLine(),
                       keymap.of([
@@ -5094,7 +6902,7 @@ function App() {
                   </div>
                 )}
                 <div className="output-content">
-                  <pre 
+                  <div 
                     className="output-text"
                     style={{
                       fontFamily: fontFamily,
@@ -5106,9 +6914,8 @@ function App() {
                       whiteSpace: 'pre-wrap',
                       wordBreak: 'break-word'
                     }}
-                  >
-                    {output1 || (sqlMode ? 'Результат появится здесь после нажатия «Выполнить» (Ctrl+Enter / F8)' : 'Вывод появится здесь после выполнения кода...')}
-                  </pre>
+                    dangerouslySetInnerHTML={{ __html: renderOutputWithImages(output1 || (sqlMode ? 'Результат появится здесь после нажатия «Выполнить» (Ctrl+Enter / F8)' : 'Вывод появится здесь после выполнения кода...')) }}
+                  />
                 </div>
               </div>
             </div>
@@ -5117,8 +6924,8 @@ function App() {
               ref={splitDividerRef}
               className="split-divider split-divider-overlay"
               style={{
-                left: `calc(${splitPaneWidth}% - 8px)`,
-                width: 16
+                left: `calc(${splitPaneWidth}% - 1px)`,
+                width: 2
               }}
               onMouseDown={(e) => {
                 e.preventDefault();
@@ -5696,12 +7503,15 @@ function App() {
                         extensions={[
                           getLanguageExtension2(), 
                           customHighlightStyle,
-                          smartAutocomplete,
+                          ...smartAutocomplete,
                           tabExtension,
                           clickToDeselectExtension,
+                          pasteHandler,
                           ...indentExtension,
                           ...enhancedBracketMatching,
                           ...minimapExtension,
+                          imageExtensions.imageSizesState,
+                          imageExtensions.imageWidgetExtension,
                           highlightActiveLineGutter(),
                           highlightActiveLine(),
                           keymap.of([
@@ -5895,17 +7705,20 @@ function App() {
                       </div>
                     )}
                     <div className="output-content">
-                      <pre 
+                      <div 
                         className="output-text"
                         style={{
                           fontFamily: fontFamily,
                           fontSize: `${fontSize}px`,
                           fontStyle: fontStyle,
-                          color: output2 ? fontColor : '#6a6a6a'
+                          color: output2 ? fontColor : '#6a6a6a',
+                          margin: 0,
+                          padding: '8px',
+                          whiteSpace: 'pre-wrap',
+                          wordBreak: 'break-word'
                         }}
-                      >
-                        {output2 || 'Вывод появится здесь после выполнения кода...'}
-                      </pre>
+                        dangerouslySetInnerHTML={{ __html: renderOutputWithImages(output2 || 'Вывод появится здесь после выполнения кода...') }}
+                      />
                     </div>
                   </div>
                 </>
@@ -6020,9 +7833,12 @@ function App() {
                     smartAutocomplete,
                     tabExtension,
                     clickToDeselectExtension,
+                    pasteHandler,
                     ...indentExtension,
                     ...enhancedBracketMatching,
                     ...minimapExtension,
+                    imageExtensions.imageSizesState,
+                    imageExtensions.imageWidgetExtension,
                     ...errorHighlightExtension,
                     highlightActiveLineGutter(),
                     highlightActiveLine(),
@@ -6156,7 +7972,7 @@ function App() {
             {/* Разделитель как оверлей — как у 2 окон, позиция по проценту */}
             <div
               className="split-divider split-divider-overlay one-window-divider"
-              style={{ left: `calc(${oneWindowEditorPercent}% - 8px)`, width: 16 }}
+              style={{ left: `calc(${oneWindowEditorPercent}% - 1px)`, width: 2 }}
               onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); setIsResizing(true); }}
               role="separator"
               aria-orientation="vertical"
@@ -6217,17 +8033,20 @@ function App() {
                 </div>
               )}
               <div className="output-content">
-                <pre 
+                <div 
                   className="output-text"
                   style={{
                     fontFamily: fontFamily,
                     fontSize: `${fontSize}px`,
                     fontStyle: fontStyle,
-                    color: output ? fontColor : '#6a6a6a'
+                    color: output ? fontColor : '#6a6a6a',
+                    margin: 0,
+                    padding: '8px',
+                    whiteSpace: 'pre-wrap',
+                    wordBreak: 'break-word'
                   }}
-                >
-                  {output || 'Вывод появится здесь после выполнения кода...'}
-                </pre>
+                  dangerouslySetInnerHTML={{ __html: renderOutputWithImages(output || 'Вывод появится здесь после выполнения кода...') }}
+                />
               </div>
             </div>
           </div>

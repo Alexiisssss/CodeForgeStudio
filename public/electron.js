@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, globalShortcut, session } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, globalShortcut, session, clipboard } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { spawn, exec } = require('child_process');
@@ -95,6 +95,13 @@ function createWindow() {
       titleBarStyle: 'default'
     });
 
+    // Блокируем F12 и Ctrl+Shift+I — консоль разработчика отключена
+    mainWindow.webContents.on('before-input-event', (event, input) => {
+      if (input.key === 'F12' || (input.control && input.shift && input.key === 'I')) {
+        event.preventDefault();
+      }
+    });
+
     // Определяем URL для загрузки
     let startUrl;
     if (isDev) {
@@ -151,11 +158,8 @@ function createWindow() {
       
       mainWindow.webContents.on('did-finish-load', () => {
         writeLog('INFO', 'Page finished loading');
-        if (isDev) {
-          mainWindow.webContents.openDevTools();
-        }
-        // Проверяем, загрузился ли React
-        mainWindow.webContents.executeJavaScript(`
+        // Проверяем, загрузился ли React (только в режиме разработки)
+        if (isDev) mainWindow.webContents.executeJavaScript(`
           setTimeout(() => {
             const root = document.getElementById('root');
             if (!root || root.innerHTML.trim() === '') {
@@ -266,6 +270,72 @@ app.on('ready', () => {
 app.on('before-quit', () => {
   globalShortcut.unregisterAll();
   writeLog('INFO', 'Application before quit');
+});
+
+// Буфер обмена: изображение в формате PNG (для вставки в редактор)
+ipcMain.handle('clipboard-get-image', () => {
+  try {
+    const formats = clipboard.availableFormats();
+    const hasImage = formats.some(f => /^image\//.test(f) || f === 'png' || f === 'PNG');
+    if (!hasImage) return null;
+    const image = clipboard.readImage();
+    if (!image || image.isEmpty()) return null;
+    const dataUrl = image.toDataURL('image/png');
+    if (!dataUrl || dataUrl.length < 100) return null;
+    return dataUrl;
+  } catch (e) {
+    writeLog('ERROR', `clipboard-get-image: ${e.message}`, e);
+    return null;
+  }
+});
+
+// Чтение изображений из временной папки Word (C:\Temp\msohtmlclip1\01\clip_image001.png и т.д.)
+// Word при копировании с картинками кладёт в HTML только file:// ссылки на эти файлы
+ipcMain.handle('clipboard-get-word-clip-images', () => {
+  try {
+    if (process.platform !== 'win32') return [];
+    const tempBase = process.env.TEMP || process.env.TMP || 'C:\\Temp';
+    const possibleDirs = [
+      path.join('C:', 'Temp', 'msohtmlclip1', '01'),
+      path.join('C:', 'Temp', 'msohtmlclip1', '02'),
+      path.join(tempBase, 'msohtmlclip1', '01'),
+      path.join(tempBase, 'msohtmlclip1', '02'),
+    ];
+    for (const dir of possibleDirs) {
+      if (!fs.existsSync(dir)) continue;
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      const imageFiles = entries
+        .filter(e => e.isFile() && /^clip_image\d+\.(png|jpg|jpeg|gif)$/i.test(e.name))
+        .map(e => e.name)
+        .sort((a, b) => {
+          const na = parseInt((a.match(/\d+/) || [0])[0], 10);
+          const nb = parseInt((b.match(/\d+/) || [0])[0], 10);
+          return na - nb;
+        });
+      if (imageFiles.length === 0) continue;
+      const result = [];
+      for (const name of imageFiles) {
+        const filePath = path.join(dir, name);
+        try {
+          const buf = fs.readFileSync(filePath);
+          const base64 = buf.toString('base64');
+          const ext = (name.match(/\.(png|jpe?g|gif)$/i) || [])[1] || 'png';
+          const mime = ext.toLowerCase() === 'jpg' || ext.toLowerCase() === 'jpeg' ? 'jpeg' : ext.toLowerCase() === 'gif' ? 'gif' : 'png';
+          result.push({ name, dataUrl: `data:image/${mime};base64,${base64}` });
+        } catch (err) {
+          writeLog('WARN', `clipboard-get-word-clip-images: не удалось прочитать ${filePath}: ${err.message}`);
+        }
+      }
+      if (result.length > 0) {
+        writeLog('INFO', `clipboard-get-word-clip-images: прочитано ${result.length} изображений из ${dir}`);
+        return result;
+      }
+    }
+    return [];
+  } catch (e) {
+    writeLog('ERROR', `clipboard-get-word-clip-images: ${e.message}`, e);
+    return [];
+  }
 });
 
 // IPC обработчики для работы с файлами (Открыть / Сохранить / Сохранить как)
